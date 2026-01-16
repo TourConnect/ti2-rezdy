@@ -11,18 +11,19 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - run: sed -i 's/"file:.*"/"latest"/' package.json
+      - name: install dependencies
+        run: npm i
       - uses: actions/setup-node@v3
         with:
           node-version: 18
-      - run: sed -i 's/"file:.*"/"latest"/' package.json
-      - name: install dependencies
-        run: npm ci
+      - run: npm ci
       - run: npm run build --if-present
       - run: npm test
         env:
           ti2_rezdy_endpoint: 'https://api.rezdy.com/v1'
           ti2_rezdy_apiKey: ${{ secrets.REZDY_APIKEY }}
-          ti2_rezdy_resellerReference: ${{ secrets.REZDY_RESELLERREFERENCE }}
+          ti2_rezdy_resellerId: ${{ secrets.REZDY_RESELLER_ID }}
           ti2_rezdy_jwtKey: ${{ secrets.REZDY_JWTKEY }}
           ti2_rezdy_environment: 'production'
   tag:
