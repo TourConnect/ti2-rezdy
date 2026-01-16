@@ -48,12 +48,9 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 18
       - run: sed -i 's/"file:.*"/"latest"/' package.json
       - name: install dependencies
-        run: npm ci
+        run: npm i
       - uses: JS-DevTools/npm-publish@v3
         with:
           token: ${{ secrets.NPM_TOKEN }}
