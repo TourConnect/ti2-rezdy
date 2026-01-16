@@ -1,1 +1,5 @@
 .vscode
+node_modules/
+# Local environment variables (keep secrets out of git)
+.env*
+*.local.sh

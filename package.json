@@ -4,7 +4,11 @@
   "description": "rezdy's TI2 Plugin",
   "main": "index.js",
   "scripts": {
-    "test": "jest"
+    "test": "jest",
+    "test:unit": "jest --testPathPattern=unit.test.js",
+    "test:integration": "jest --testPathPattern=integration.test.js",
+    "test:coverage": "jest --coverage",
+    "test:watch": "jest --watch"
   },
   "repository": {
     "type": "git",
