@@ -24,7 +24,7 @@ jobs:
           ti2_rezdy_endpoint: 'https://api.rezdy.com/v1'
           ti2_rezdy_apiKey: ${{ secrets.REZDY_APIKEY }}
           ti2_rezdy_resellerId: ${{ secrets.REZDY_RESELLER_ID }}
-          ti2_rezdy_jwtKey: ${{ secrets.REZDY_JWTKEY }}
+          ti2_rezdy_jwtKey: 'Reliance-Overload106-Lyrics'
           ti2_rezdy_environment: 'production'
   tag:
     if: github.ref == 'refs/heads/main'
