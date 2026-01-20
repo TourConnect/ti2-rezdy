@@ -7,6 +7,33 @@ const STATUS_CANCELLED = 'CANCELLED';
 // Default option ID for bookings without specific options
 const DEFAULT_OPTION_ID = 'default';
 
+/**
+ * Constructs the Rezdy dashboard URL for a booking from the API endpoint
+ * @param {string} orderNumber - The order/booking number (e.g., 'R4DLYBR')
+ * @param {string} apiEndpoint - API endpoint URL (e.g., 'https://api.rezdy.com/v1')
+ * @returns {string} Full dashboard URL
+ */
+const buildDashboardUrl = (orderNumber, apiEndpoint) => {
+  if (!orderNumber) return '';
+  if (!apiEndpoint || typeof apiEndpoint !== 'string') return '';
+
+  try {
+    // Parse the API endpoint URL
+    const url = new URL(apiEndpoint);
+
+    // Transform api.rezdy.com -> app.rezdy.com
+    // Transform api.rezdy-staging.com -> app.rezdy-staging.com
+    // Works with any domain following this pattern
+    const dashboardHost = url.host.replace(/^api\./, 'app.');
+
+    // Construct the dashboard URL
+    return `${url.protocol}//${dashboardHost}/orders/edit/${orderNumber}`;
+  } catch (err) {
+    // If URL parsing fails, return empty string
+    return '';
+  }
+};
+
 const resolvers = {
   Query: {
     id: R.path(['orderNumber']),
@@ -53,7 +80,13 @@ const resolvers = {
     resellerReference: R.propOr('', 'resellerReference'),
     // Public URL for booking confirmation (customer-facing)
     publicUrl: R.prop('confirmation_url'),
-    privateUrl: R.prop('dashboard_url'),
+    // Private URL for booking dashboard (supplier-facing)
+    // Constructed dynamically since Rezdy API doesn't return this field
+    privateUrl: root => {
+      const orderNumber = root.orderNumber;
+      const apiEndpoint = root._rezdyApiEndpoint;
+      return buildDashboardUrl(orderNumber, apiEndpoint);
+    },
     pickupRequested: R.prop('pickupRequested'),
     pickupPointId: R.prop('pickupPointId'),
     pickupPoint: root => {
@@ -77,13 +110,21 @@ const resolvers = {
  * @param {Object} params.rootValue - Root value object (may be wrapped or direct booking)
  * @param {string} params.typeDefs - GraphQL type definitions
  * @param {string} params.query - GraphQL query string
+ * @param {string} [params.apiEndpoint] - API endpoint URL for dashboard URL construction
  * @returns {Promise<Object>} Translated booking data
  * @throws {Error} If GraphQL execution fails
  */
-const translateBooking = async ({ rootValue, typeDefs, query }) => {
+const translateBooking = async ({ rootValue, typeDefs, query, apiEndpoint }) => {
   // Handle wrapped booking format: { requestStatus: {...}, booking: {...} }
   // or direct booking format: { orderNumber: ..., status: ..., ... }
-  const booking = rootValue && rootValue.booking ? rootValue.booking : rootValue;
+  let booking = rootValue && rootValue.booking ? rootValue.booking : rootValue;
+
+  // Add endpoint to booking data for dashboard URL construction
+  // Create a new object to avoid mutating the original
+  booking = {
+    ...booking,
+    _rezdyApiEndpoint: apiEndpoint,
+  };
   
   const schema = makeExecutableSchema({
     typeDefs,

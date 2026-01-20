@@ -64,7 +64,6 @@ const getHeaders = ({
   'Content-Type': 'application/json',
 });
 
-
 /**
  * Safely extracts request information from axios request config
  * Sanitizes sensitive data like API keys from headers
@@ -850,6 +849,7 @@ class Plugin {
         rootValue: booking,
         typeDefs: bookingTypeDefs,
         query: bookingQuery,
+        apiEndpoint: validatedEndpoint,
       })
     });
   }
@@ -892,6 +892,7 @@ class Plugin {
         rootValue: booking,
         typeDefs: bookingTypeDefs,
         query: bookingQuery,
+        apiEndpoint: validatedEndpoint,
       })
     });
   }
@@ -1048,6 +1049,7 @@ class Plugin {
           rootValue: booking,
           typeDefs: bookingTypeDefs,
           query: bookingQuery,
+          apiEndpoint: validatedEndpoint,
         });
       }).then(results => results.filter(Boolean))
     });

@@ -298,4 +298,125 @@ describe('Booking Resolver Unit Tests', () => {
       expect(result.unitItems[1].quantity).toBe(1);
     });
   });
+
+  describe('Private URL resolver', () => {
+    const privateUrlQuery = `query { privateUrl }`;
+
+    it('should build production dashboard URL from API endpoint', async () => {
+      const rootValue = {
+        orderNumber: 'R4DLYBR',
+        status: 'CONFIRMED',
+        items: [],
+      };
+
+      const result = await translateBooking({
+        rootValue,
+        typeDefs: mockTypeDefs,
+        query: privateUrlQuery,
+        apiEndpoint: 'https://api.rezdy.com/v1',
+      });
+
+      expect(result.privateUrl).toBe('https://app.rezdy.com/orders/edit/R4DLYBR');
+    });
+
+    it('should build staging dashboard URL from API endpoint', async () => {
+      const rootValue = {
+        orderNumber: 'R4DLYBR',
+        status: 'CONFIRMED',
+        items: [],
+      };
+
+      const result = await translateBooking({
+        rootValue,
+        typeDefs: mockTypeDefs,
+        query: privateUrlQuery,
+        apiEndpoint: 'https://api.rezdy-staging.com/v1',
+      });
+
+      expect(result.privateUrl).toBe('https://app.rezdy-staging.com/orders/edit/R4DLYBR');
+    });
+
+    it('should work with endpoint without /v1 path', async () => {
+      const rootValue = {
+        orderNumber: 'R4DLYBR',
+        status: 'CONFIRMED',
+        items: [],
+      };
+
+      const result = await translateBooking({
+        rootValue,
+        typeDefs: mockTypeDefs,
+        query: privateUrlQuery,
+        apiEndpoint: 'https://api.rezdy.com',
+      });
+
+      expect(result.privateUrl).toBe('https://app.rezdy.com/orders/edit/R4DLYBR');
+    });
+
+    it('should handle missing orderNumber', async () => {
+      const rootValue = {
+        status: 'CONFIRMED',
+        items: [],
+      };
+
+      const result = await translateBooking({
+        rootValue,
+        typeDefs: mockTypeDefs,
+        query: privateUrlQuery,
+        apiEndpoint: 'https://api.rezdy.com/v1',
+      });
+
+      expect(result.privateUrl).toBe('');
+    });
+
+    it('should handle missing endpoint', async () => {
+      const rootValue = {
+        orderNumber: 'R4DLYBR',
+        status: 'CONFIRMED',
+        items: [],
+      };
+
+      const result = await translateBooking({
+        rootValue,
+        typeDefs: mockTypeDefs,
+        query: privateUrlQuery,
+      });
+
+      expect(result.privateUrl).toBe('');
+    });
+
+    it('should handle invalid endpoint URL', async () => {
+      const rootValue = {
+        orderNumber: 'R4DLYBR',
+        status: 'CONFIRMED',
+        items: [],
+      };
+
+      const result = await translateBooking({
+        rootValue,
+        typeDefs: mockTypeDefs,
+        query: privateUrlQuery,
+        apiEndpoint: 'not-a-valid-url',
+      });
+
+      expect(result.privateUrl).toBe('');
+    });
+
+    it('should work with custom domains', async () => {
+      const rootValue = {
+        orderNumber: 'R4DLYBR',
+        status: 'CONFIRMED',
+        items: [],
+      };
+
+      const result = await translateBooking({
+        rootValue,
+        typeDefs: mockTypeDefs,
+        query: privateUrlQuery,
+        apiEndpoint: 'https://api.rezdy-custom.example.com/v1',
+      });
+
+      expect(result.privateUrl).toBe('https://app.rezdy-custom.example.com/orders/edit/R4DLYBR');
+    });
+  });
 });
