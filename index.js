@@ -154,18 +154,19 @@ class Plugin {
     };
     /**
      * Returns the token template for API authentication
-     * @returns {Object} Token template with apiKey and resellerId fields
+     * @returns {Object} Token template with apiKey and agentCode fields
      */
     this.tokenTemplate = () => ({
       apiKey: {
         type: 'text',
         regExp: /^[a-fA-F0-9]+$/,
-        description: 'the Api Key provided from Rezdy, should be in uuid format',
+        description: 'the API Key provided from Rezdy, should be in uuid format',
       },
-      resellerId: {
+      agentCode: {
         type: 'text',
-        regExp: /^[a-fA-F0-9]+$/,
-        description: 'the Reseller Id provided from Rezdy, should be in uuid format',
+        regExp: /^[a-zA-Z0-9]+$/,
+        description: 'the Agent Code provided by Rezdy, should be an alphanumeric string',
+        example: 'WONDERFULGLOBALTRAVEL',
       },
     });
   }
@@ -654,7 +655,7 @@ class Plugin {
   /**
    * Creates a booking from an availability key
    * @param {Object} params - Booking creation parameters
-   * @param {Object} params.token - Token object with endpoint, apiKey, and optional resellerId
+   * @param {Object} params.token - Token object with endpoint, apiKey, and optional agentCode
    * @param {Object} params.payload - Booking payload with availabilityKey, holder, etc.
    * @param {Object} params.typeDefsAndQueries - GraphQL type definitions and query
    * @returns {Promise<Object>} Object with booking result
@@ -663,7 +664,7 @@ class Plugin {
     token: {
       endpoint,
       apiKey,
-      resellerId,
+      agentCode,
     },
     payload: {
       availabilityKey,
@@ -675,6 +676,7 @@ class Plugin {
       participants,
       payments,
       createdBy,
+      integrationIsDirectBooking = false,
     },
     typeDefsAndQueries: {
       bookingTypeDefs,
@@ -684,6 +686,10 @@ class Plugin {
     assert(availabilityKey, 'an availability code is required !');
     assert(R.path(['name'], holder), "a holder's first name is required");
     assert(R.path(['surname'], holder), "a holder's surname is required");
+    // Agent code is only required for non-direct bookings
+    if (!integrationIsDirectBooking) {
+      assert(agentCode, 'an agent code is required');
+    }
     const validatedEndpoint = this.validateEndpoint(endpoint);
     const headers = getHeaders({
       apiKey,
@@ -834,8 +840,9 @@ class Plugin {
       })(),
       // Reseller reference if provided
       ...(reference ? { resellerReference: reference } : {}),
-      // Reseller ID if provided
-      ...(resellerId ? { resellerId } : {}),
+      // Source Channel if provided
+      // NOTE: The Rezdy UI uses the name as Agent Code, but the API expects it as Source Channel
+      ...(agentCode ? { sourceChannel: agentCode } : {}),
     };
     
     let booking = R.path(['data'], await this.axios({

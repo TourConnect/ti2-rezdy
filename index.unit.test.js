@@ -204,11 +204,11 @@ describe('Unit Tests - Helper Functions', () => {
       expect(template.apiKey).toHaveProperty('regExp');
     });
 
-    it('should return template with resellerId', () => {
+    it('should return template with agentCode', () => {
       const template = plugin.tokenTemplate();
-      expect(template).toHaveProperty('resellerId');
-      expect(template.resellerId).toHaveProperty('type', 'text');
-      expect(template.resellerId).toHaveProperty('regExp');
+      expect(template).toHaveProperty('agentCode');
+      expect(template.agentCode).toHaveProperty('type', 'text');
+      expect(template.agentCode).toHaveProperty('regExp');
     });
 
     it('should validate apiKey regex', () => {
