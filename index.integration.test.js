@@ -1,6 +1,7 @@
 /* globals describe, beforeAll, beforeEach, it, expect, jest */
 const R = require('ramda');
 const moment = require('moment');
+const axios = require('axios');
 
 const Plugin = require('./index');
 
@@ -115,7 +116,7 @@ describe('mocked integration tests', () => {
   const token = {
     endpoint: 'https://api.rezdy.com/v1',
     apiKey: 'mock-api-key-12345',
-    resellerId: 'mock-reseller-id-67890',
+    agentCode: 'MOCKSOURCECHANNEL67890',
   };
   
   const dateFormat = 'DD/MM/YYYY';
@@ -153,7 +154,7 @@ describe('mocked integration tests', () => {
         template = await app.tokenTemplate();
         const rules = Object.keys(template);
         expect(rules).toContain('apiKey');
-        expect(rules).toContain('resellerId');
+        expect(rules).toContain('agentCode');
       });
       
       it('should validate apiKey format', () => {
@@ -163,11 +164,12 @@ describe('mocked integration tests', () => {
         expect(apiKey.test('df2ce6e19ba4d3b749c88025d42a9a4e31cd2e9ac603ffd8acedeee615a76e42')).toBeTruthy();
       });
       
-      it('should validate resellerId format', () => {
+      it('should validate agentCode format', () => {
         const template = app.tokenTemplate();
-        const resellerId = template.resellerId.regExp;
-        expect(resellerId.test('something')).toBeFalsy();
-        expect(resellerId.test('df2ce6e19ba4d3b749c88025d42a9a4e31cd2e9ac603ffd8acedeee615a76e42')).toBeTruthy();
+        const agentCode = template.agentCode.regExp;
+        expect(agentCode.test('invalid-with-dash')).toBeFalsy();
+        expect(agentCode.test('WONDERFULGLOBALTRAVEL')).toBeTruthy();
+        expect(agentCode.test('ABCDEF123')).toBeTruthy();
       });
     });
   });
@@ -324,6 +326,42 @@ describe('mocked integration tests', () => {
       expect(booking).toBeTruthy();
       expect(R.path(['id'], booking)).toBeTruthy();
       expect(R.path(['supplierBookingId'], booking)).toBeTruthy();
+
+      // Ensure Agent Code is sent to Rezdy as sourceChannel
+      const createBookingRequest = axios.mock.calls.find(([config]) =>
+        config && config.method === 'post' && config.url.includes('/bookings')
+      );
+      expect(createBookingRequest).toBeTruthy();
+      expect(createBookingRequest[0].data).toMatchObject({
+        sourceChannel: token.agentCode,
+      });
+    });
+
+    it('should allow direct booking without agentCode', async () => {
+      const { agentCode, ...tokenWithoutAgentCode } = token;
+      expect(agentCode).toBeTruthy();
+
+      const retVal = await app.createBooking({
+        token: tokenWithoutAgentCode,
+        typeDefsAndQueries,
+        payload: {
+          availabilityKey,
+          integrationIsDirectBooking: true,
+          holder: {
+            name: 'Direct',
+            surname: 'Booking',
+            phoneNumber: '+1234567890',
+            emailAddress: 'direct.booking@example.com',
+          },
+        },
+      });
+
+      expect(retVal.booking).toBeTruthy();
+      const createBookingRequest = axios.mock.calls.find(([config]) =>
+        config && config.method === 'post' && config.url.includes('/bookings')
+      );
+      expect(createBookingRequest).toBeTruthy();
+      expect(createBookingRequest[0].data).not.toHaveProperty('sourceChannel');
     });
     
     it('should search bookings by ID', async () => {
@@ -428,6 +466,27 @@ describe('mocked integration tests', () => {
     });
 
     describe('Booking creation errors', () => {
+      it('should throw error when agentCode is missing for non-direct bookings', async () => {
+        const tokenWithoutAgentCode = {
+          endpoint: token.endpoint,
+          apiKey: token.apiKey,
+        };
+
+        await expect(
+          app.createBooking({
+            token: tokenWithoutAgentCode,
+            typeDefsAndQueries,
+            payload: {
+              availabilityKey: 'fake-key',
+              holder: {
+                name: 'John',
+                surname: 'Doe',
+              },
+            },
+          })
+        ).rejects.toThrow('an agent code is required');
+      });
+
       it('should throw error when availabilityKey is missing', async () => {
         await expect(
           app.createBooking({

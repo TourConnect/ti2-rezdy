@@ -14,7 +14,7 @@ jobs:
       - run: sed -i 's/"file:.*"/"latest"/' package.json
       - name: install dependencies
         run: npm i
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: 18
       - run: npm ci
@@ -23,7 +23,6 @@ jobs:
         env:
           ti2_rezdy_endpoint: 'https://api.rezdy.com/v1'
           ti2_rezdy_apiKey: ${{ secrets.REZDY_APIKEY }}
-          ti2_rezdy_resellerId: ${{ secrets.REZDY_RESELLER_ID }}
           ti2_rezdy_jwtKey: 'Reliance-Overload106-Lyrics'
           ti2_rezdy_environment: 'production'
   tag:
@@ -51,6 +50,6 @@ jobs:
       - run: sed -i 's/"file:.*"/"latest"/' package.json
       - name: install dependencies
         run: npm i
-      - uses: JS-DevTools/npm-publish@v3
+      - uses: JS-DevTools/npm-publish@v4
         with:
           token: ${{ secrets.NPM_TOKEN }}
