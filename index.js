@@ -6,6 +6,20 @@ const assert = require('assert');
 const moment = require('moment');
 const jwt = require('jsonwebtoken');
 const wildcardMatch = require('./utils/wildcardMatch');
+const { DEFAULT_EXCLUDED_CUSTOMER_QUESTION_IDS } = require('./utils/customerFieldConstants');
+const {
+  CORE_CREATE_BOOKING_FIELD_IDS_BY_LABEL,
+  resolveBookingFieldValue,
+  buildBookingFields,
+  toCreateBookingFieldModel,
+  filterFieldRowsForBookingLevelMerge,
+  filterFieldRowsForParticipantLevelMerge,
+  mergeFieldsWithExplicitValues,
+  mergeHolderWithCustomFieldValues,
+  decorateCountryFields,
+  decorateGenderField,
+} = require('./utils/bookingFields');
+const { getIso31661Alpha2Countries } = require('./utils/country');
 const { translateProduct } = require('./resolvers/product');
 const { translateAvailability } = require('./resolvers/availability');
 const { translateBooking } = require('./resolvers/booking');
@@ -25,10 +39,19 @@ const SKIP_EMAIL_VALUE = 'collect';
 // Payment type constants
 const PAYMENT_TYPE_CASH = 'CASH';
 const PAYMENT_RECIPIENT_SUPPLIER = 'SUPPLIER';
-// Booking status constants
-const STATUS_CANCELLED = 'CANCELLED';
-// Default option ID
-const DEFAULT_OPTION_ID = 'default';
+// Default participant fields when product booking fields are unavailable
+const DEFAULT_PARTICIPANT_BOOKING_FIELDS = [
+  {
+    label: 'First Name',
+    visiblePerParticipant: false,
+    requiredPerParticipant: false,
+  },
+  {
+    label: 'Last Name',
+    visiblePerParticipant: false,
+    requiredPerParticipant: false,
+  },
+];
 
 if (process.env.debug) {
   curlirize(axiosRaw);
@@ -38,8 +61,6 @@ const isNilOrEmpty = R.either(R.isNil, R.isEmpty);
 
 /**
  * Validates if a string is a valid URL
- * @param {string} string - String to validate
- * @returns {boolean} True if valid URL, false otherwise
  */
 const isValidUrl = (string) => {
   if (!string || typeof string !== 'string') return false;
@@ -52,14 +73,26 @@ const isValidUrl = (string) => {
 };
 
 /**
- * Gets headers for API requests
- * @param {Object} params - Header parameters
- * @param {string} params.apiKey - API key for authentication
- * @returns {Object} Headers object
+ * Validate and normalize endpoint URL.
+ * @param {string} endpoint - Endpoint URL to validate
+ * @param {string} [fallback] - Fallback endpoint when none provided
+ * @returns {string} Validated endpoint or default
+ * @throws {Error} If endpoint is provided but invalid
  */
-const getHeaders = ({
-  apiKey,
-}) => ({
+const validateEndpoint = (endpoint, fallback) => {
+  if (!endpoint) {
+    return fallback || DEFAULT_ENDPOINT;
+  }
+  if (!isValidUrl(endpoint)) {
+    throw new Error(`Invalid endpoint URL: ${endpoint}`);
+  }
+  return endpoint;
+};
+
+/**
+ * Builds the standard set of Rezdy API headers.
+ */
+const getHeaders = ({ apiKey }) => ({
   apiKey,
   'Content-Type': 'application/json',
 });
@@ -67,13 +100,10 @@ const getHeaders = ({
 /**
  * Safely extracts request information from axios request config
  * Sanitizes sensitive data like API keys from headers
- * @param {Object} request - Axios request config object
- * @returns {Object} Safe request object with only selected fields and sanitized headers
  */
 const axiosSafeRequest = (request) => {
   const safe = R.pick(['method', 'url', 'data'], request);
   if (request.headers) {
-    // Omit sensitive headers to prevent API key leakage in logs
     safe.headers = R.omit(['apiKey', 'apikey', 'authorization', 'Authorization'], request.headers);
   }
   return safe;
@@ -81,25 +111,355 @@ const axiosSafeRequest = (request) => {
 
 /**
  * Safely extracts response information from axios response
- * @param {Object} response - Axios response object
- * @returns {Object} Safe response object with sanitized request field
  */
-const axiosSafeResponse = response => {
+const axiosSafeResponse = (response) => {
   const retVal = R.pick(['data', 'status', 'statusText', 'headers', 'request'], response);
   retVal.request = axiosSafeRequest(retVal.request);
   return retVal;
 };
+
+const stripTravelerPrefix = (label) => {
+  const raw = String(label || '').trim();
+  if (!raw) return '';
+  return raw.replace(/^[A-Za-z]+\s+\d+:\s*/i, '').trim();
+};
+
+const normalizeParticipantFieldRows = (rows) => {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((row) => {
+    if (!row || typeof row !== 'object') return null;
+    if (row.id || row.label) {
+      return {
+        ...(row.id ? { id: String(row.id) } : {}),
+        ...(row.label ? { label: stripTravelerPrefix(row.label) || String(row.label) } : {}),
+        value: row.value !== undefined && row.value !== null ? String(row.value) : '',
+      };
+    }
+    const nestedField = R.path(['field'], row);
+    if (!nestedField || typeof nestedField !== 'object') return null;
+    const id = nestedField.id != null && nestedField.id !== '' ? String(nestedField.id) : null;
+    const rawLabel = nestedField.label || nestedField.title;
+    const label = rawLabel ? stripTravelerPrefix(rawLabel) : null;
+    if (!id && !label) return null;
+    return {
+      ...(id ? { id } : {}),
+      ...(label ? { label: String(label) } : {}),
+      value: row.value !== undefined && row.value !== null ? String(row.value) : '',
+    };
+  }).filter(Boolean);
+};
+
+const normalizeParticipantData = (participant) => {
+  const participantData = participant && typeof participant === 'object' ? participant : {};
+  const participantFieldRows = Array.isArray(participantData.fields) ? participantData.fields : [];
+  const participantCustomFieldRows = Array.isArray(participantData.customFieldValues)
+    ? participantData.customFieldValues
+    : [];
+  const normalizedFields = normalizeParticipantFieldRows(
+    participantFieldRows.concat(participantCustomFieldRows),
+  );
+  const valueById = normalizedFields.reduce((acc, row) => ({
+    ...acc,
+    ...(row.id ? { [row.id]: row.value } : {}),
+  }), {});
+  return {
+    ...participantData,
+    fields: normalizedFields,
+    firstName: participantData.firstName || valueById.firstName || participantData.name,
+    lastName: participantData.lastName || valueById.lastName || participantData.surname,
+  };
+};
+
+/**
+ * Extracts the single product object from a Rezdy /products/:id response.
+ * Rezdy returns either { products: [obj] }, { products: obj }, or { product: obj }.
+ */
+const extractSingleProduct = (responseData) => {
+  if (!responseData || typeof responseData !== 'object') return null;
+  if (Array.isArray(responseData.products)) return responseData.products[0] || null;
+  if (responseData.products && typeof responseData.products === 'object') return responseData.products;
+  if (responseData.product && typeof responseData.product === 'object') return responseData.product;
+  return null;
+};
+
+/**
+ * Calculates seats available from availability object.
+ * Handles multiple field name variations and ensures numeric return.
+ */
+const calculateSeatsAvailable = (avail) => {
+  if (!avail) return 0;
+  const seats = avail.seatsAvailable !== undefined ? avail.seatsAvailable
+    : (avail.available !== undefined ? avail.available
+      : (avail.vacancies !== undefined ? avail.vacancies
+        : (avail.availableSeats !== undefined ? avail.availableSeats
+          : (avail.remainingSeats !== undefined ? avail.remainingSeats : 0))));
+  return Number(seats) || 0;
+};
+
+/**
+ * Extract availability data from Rezdy API response.
+ * Handles multiple response structures (direct array, wrapped, requestStatus, single object).
+ */
+const extractAvailabilityData = (data, productId) => {
+  if (!data) return [];
+
+  if (data.requestStatus) {
+    if (data.requestStatus.success === false) {
+      if (process.env.debug) {
+        console.log(`API error for product ${productId}:`, data.requestStatus);
+      }
+      return [];
+    }
+    if (Array.isArray(data.sessions)) return data.sessions;
+    if (Array.isArray(data.availability)) return data.availability;
+    if (Array.isArray(data.data)) return data.data;
+    if (Array.isArray(data.items)) return data.items;
+  }
+
+  if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data.data)) return data.data;
+  if (data && Array.isArray(data.availability)) return data.availability;
+  if (data && Array.isArray(data.sessions)) return data.sessions;
+  if (data && Array.isArray(data.items)) return data.items;
+  if (data && typeof data === 'object' && !data.requestStatus) {
+    return [data];
+  }
+
+  if (process.env.debug) {
+    console.log(`Unexpected response structure for product ${productId}:`, JSON.stringify(data, null, 2));
+  }
+  return [];
+};
+
+/**
+ * Normalize the per-product list of optionIds. Mirrors ti2-rezdy's
+ * `normaliseOptionIds`: callers may pass an empty array, a single option
+ * (broadcast to every product), or one option per product. Throws when
+ * counts don't match — preserves the existing
+ * `mismatched productIds/options length` error.
+ */
+const normaliseOptionIds = (productIds, optionIds = []) => {
+  if (!Array.isArray(productIds) || productIds.length === 0) return [];
+
+  if (!Array.isArray(optionIds) || optionIds.length === 0) {
+    return productIds.map(() => null);
+  }
+
+  if (optionIds.length === 1 && productIds.length > 1) {
+    return productIds.map(() => optionIds[0]);
+  }
+
+  if (optionIds.length !== productIds.length) {
+    throw new Error('mismatched productIds/options length');
+  }
+
+  return optionIds;
+};
+
+/**
+ * Normalize the per-product list of unit configs. Mirrors ti2-rezdy's
+ * `normaliseUnits`. Preserves the existing
+ * `mismatched options/units length` error message.
+ */
+const normaliseUnits = (productIds, units = []) => {
+  if (!Array.isArray(productIds) || productIds.length === 0) return [];
+
+  if (!Array.isArray(units) || units.length === 0) {
+    return productIds.map(() => []);
+  }
+
+  if (!Array.isArray(units[0])) {
+    return productIds.map(() => units);
+  }
+
+  if (units.length !== productIds.length) {
+    throw new Error('mismatched options/units length');
+  }
+
+  return units;
+};
+
+/**
+ * Normalise a single Rezdy availability/session object into the shape
+ * the GraphQL availability resolvers expect. Returns null if the slot
+ * should be filtered out (missing start time, or status that is not one
+ * of AVAILABLE/FREESALE).
+ */
+const buildAvailabilityRoot = ({ avail, pickupPoints, units }) => {
+  let status = avail.status || avail.availabilityStatus || avail.availability?.status;
+  const seatsAvailable = calculateSeatsAvailable(avail);
+  if (!status) {
+    status = seatsAvailable > 0 ? STATUS_AVAILABLE : null;
+  }
+
+  const startTimeLocal = avail.startTimeLocal || avail.startTime || avail.start;
+  const endTimeLocal = avail.endTimeLocal || avail.endTime || avail.end;
+  const allDay = avail.allDay !== undefined ? avail.allDay : (avail.allDayEvent || false);
+  const priceOptions = avail.priceOptions || avail.prices || avail.pricingOptions || [];
+
+  if (!startTimeLocal || !status) return null;
+  if (status !== STATUS_AVAILABLE && status !== STATUS_FREESALE) return null;
+
+  return {
+    ...avail,
+    pickupPoints,
+    unitsWithQuantity: units,
+    status,
+    startTimeLocal,
+    endTimeLocal,
+    allDay,
+    seatsAvailable,
+    priceOptions: Array.isArray(priceOptions) ? priceOptions : [],
+  };
+};
+
+/**
+ * Fetch pickup locations for a single product. Errors are swallowed and
+ * an empty array returned (pickup data is optional).
+ */
+const fetchPickupPointsForProduct = async ({
+  axios,
+  validatedEndpoint,
+  headers,
+  productId,
+}) => {
+  try {
+    const response = await axios({
+      method: 'get',
+      url: `${validatedEndpoint}/products/${encodeURIComponent(productId)}/pickups`,
+      headers,
+    });
+    return R.pathOr([], ['data', 'pickupLocations'], response);
+  } catch (err) {
+    if (process.env.debug) {
+      console.warn(`Unable to fetch pickup points for product ${productId}`, err.message || err);
+    }
+    return [];
+  }
+};
+
+/**
+ * Fetch product bookingFields keyed by productCode.
+ * Deduplicates productCodes and runs lookups in parallel.
+ * Best-effort: missing/failed products map to [].
+ */
+const fetchBookingFieldsByProductCode = async ({
+  axios,
+  validatedEndpoint,
+  headers,
+  productCodes,
+}) => {
+  const unique = Array.from(new Set((productCodes || []).filter(Boolean)));
+  const result = {};
+
+  await Promise.map(unique, async (productCode) => {
+    try {
+      const response = await axios({
+        method: 'get',
+        url: `${validatedEndpoint}/products/${encodeURIComponent(productCode)}`,
+        headers,
+      });
+      const product = extractSingleProduct(R.path(['data'], response));
+      result[productCode] = Array.isArray(R.path(['bookingFields'], product))
+        ? product.bookingFields
+        : [];
+    } catch (err) {
+      if (process.env.debug) {
+        console.warn(`Unable to fetch bookingFields for product ${productCode}`, err.message || err);
+      }
+      result[productCode] = [];
+    }
+  }, { concurrency: CONCURRENCY });
+
+  return result;
+};
+
+/**
+ * Fetch and translate availability for a single product.
+ * Mirrors ti2-rezdy's `fetchAvailabilityForProduct` pattern: the per-product
+ * loop body is a pure helper rather than inlined inside `searchAvailability`.
+ */
+const fetchAvailabilityForProduct = async ({
+  axios,
+  validatedEndpoint,
+  headers,
+  productId,
+  optionId,
+  units,
+  localDateStart,
+  localDateEnd,
+  currency,
+  jwtKey,
+  availTypeDefs,
+  availQuery,
+  pickupPoints,
+  bookingFields,
+}) => {
+  const url = `${validatedEndpoint}/availability`
+    + `?productCode=${encodeURIComponent(productId)}`
+    + `&startTimeLocal=${encodeURIComponent(localDateStart)}`
+    + `&endTimeLocal=${encodeURIComponent(localDateEnd)}`;
+
+  const response = await axios({
+    method: 'get',
+    url,
+    headers,
+  });
+
+  const availabilities = extractAvailabilityData(response.data, productId);
+
+  const slots = await Promise.map(availabilities, async (avail) => {
+    const rootValue = buildAvailabilityRoot({ avail, pickupPoints, units });
+    if (!rootValue) return null;
+
+    const result = await translateAvailability({
+      typeDefs: availTypeDefs,
+      query: availQuery,
+      rootValue,
+      variableValues: {
+        productId,
+        optionId,
+        currency,
+        unitsWithQuantity: units,
+        jwtKey,
+      },
+    });
+
+    return {
+      ...result,
+      getCreateBookingFields: bookingFields || [],
+    };
+  });
+
+  return slots.filter(Boolean);
+};
+
+/**
+ * Common booking translation helper used by createBooking, cancelBooking,
+ * and searchBooking. Mirrors ti2-rezdy's `toTranslatedBooking`.
+ */
+const toTranslatedBooking = ({
+  rootValue,
+  bookingTypeDefs,
+  bookingQuery,
+  validatedEndpoint,
+}) => translateBooking({
+  rootValue,
+  typeDefs: bookingTypeDefs,
+  query: bookingQuery,
+  apiEndpoint: validatedEndpoint,
+});
+
 class Plugin {
   /**
    * Plugin constructor
    * @param {Object} params - Plugin configuration parameters
    * @param {string} [params.endpoint] - Rezdy API endpoint (defaults to production)
    */
-  constructor(params) { // we get the env variables from here
+  constructor(params) {
     Object.entries(params).forEach(([attr, value]) => {
       this[attr] = value;
     });
-    // Set default endpoint if not provided
     if (!this.endpoint) {
       this.endpoint = DEFAULT_ENDPOINT;
     }
@@ -121,12 +481,10 @@ class Plugin {
         // This is a valid HTTP response but indicates an API-level error
         if (response.data && response.data.requestStatus && !response.data.requestStatus.success) {
           const errorCode = R.path(['data', 'requestStatus', 'error', 'errorCode'], response);
-          // Error code '24' means "No order found" - this is expected in search scenarios
-          // Don't treat it as an exception, return the response so caller can handle it
+          // Error code '24' means "No order found" - expected in search scenarios
           if (errorCode === ERROR_CODE_NO_ORDER_FOUND) {
             return response;
           }
-          // For other API errors, throw an error
           const errorMessage = R.path(['data', 'requestStatus', 'error', 'errorMessage'], response);
           const error = new Error(errorMessage || 'API request failed');
           error.response = response;
@@ -136,7 +494,6 @@ class Plugin {
         return response;
       } catch (err) {
         const errMsg = R.omit(['config'], err.toJSON ? err.toJSON() : {});
-        // Only log errors that are not expected "not found" responses
         const errorCode = R.path(['response', 'data', 'requestStatus', 'error', 'errorCode'], err);
         if (errorCode !== ERROR_CODE_NO_ORDER_FOUND) {
           if (process.env.debug) {
@@ -149,13 +506,16 @@ class Plugin {
             });
           }
         }
+        const rezdyErrorMessage = R.path(['response', 'data', 'requestStatus', 'error', 'errorMessage'], err);
+        if (rezdyErrorMessage) {
+          const apiError = new Error(rezdyErrorMessage);
+          apiError.errorCode = errorCode;
+          apiError.response = err.response;
+          throw apiError;
+        }
         throw R.pathOr(err, ['response', 'data', 'details'], err);
       }
     };
-    /**
-     * Returns the token template for API authentication
-     * @returns {Object} Token template with apiKey and agentCode fields
-     */
     this.tokenTemplate = () => ({
       apiKey: {
         type: 'text',
@@ -172,101 +532,30 @@ class Plugin {
   }
 
   /**
-   * Validates and normalizes endpoint URL
-   * @param {string} endpoint - Endpoint URL to validate
-   * @returns {string} Validated endpoint or default
-   * @throws {Error} If endpoint is provided but invalid
+   * Validate and normalise endpoint URL. Thin wrapper around the
+   * module-level `validateEndpoint` so the instance fallback (`this.endpoint`)
+   * is always honoured. Kept on the class for back-compat with unit tests.
    */
   validateEndpoint(endpoint) {
-    if (!endpoint) {
-      return this.endpoint || DEFAULT_ENDPOINT;
-    }
-    if (!isValidUrl(endpoint)) {
-      throw new Error(`Invalid endpoint URL: ${endpoint}`);
-    }
-    return endpoint;
+    return validateEndpoint(endpoint, this.endpoint || DEFAULT_ENDPOINT);
   }
 
   /**
-   * Calculates seats available from availability object
-   * Handles multiple field name variations and ensures numeric return
-   * @param {Object} avail - Availability object
-   * @returns {number} Number of seats available (always a number, never string)
+   * Backwards-compat instance method delegating to the pure helper.
    */
   calculateSeatsAvailable(avail) {
-    if (!avail) return 0;
-    const seats = avail.seatsAvailable !== undefined ? avail.seatsAvailable 
-      : (avail.available !== undefined ? avail.available 
-        : (avail.vacancies !== undefined ? avail.vacancies 
-          : (avail.availableSeats !== undefined ? avail.availableSeats 
-            : (avail.remainingSeats !== undefined ? avail.remainingSeats : 0))));
-    // Ensure numeric return value to prevent string/number type issues
-    return Number(seats) || 0;
+    return calculateSeatsAvailable(avail);
   }
 
   /**
-   * Extract availability data from Rezdy API response
-   * Handles multiple response structures:
-   * - Direct array: [{...}, {...}]
-   * - Wrapped: { data: [{...}, {...}] }
-   * - Wrapped: { availability: [{...}, {...}] }
-   * - Wrapped: { sessions: [{...}, {...}] }
-   * - Single object: {...}
-   * @param {Object|Array} data - API response data
-   * @param {string} productId - Product identifier for logging
-   * @returns {Array<Object>} Extracted availability data array
+   * Backwards-compat instance method delegating to the pure helper.
    */
   extractAvailabilityData(data, productId) {
-    if (!data) return [];
-    
-    // If response has a requestStatus wrapper, check it first
-    if (data.requestStatus) {
-      if (data.requestStatus.success === false) {
-        // API error - return empty array
-        if (process.env.debug) {
-          console.log(`API error for product ${productId}:`, data.requestStatus);
-        }
-        return [];
-      }
-      // If success, the actual data might be in a different field
-      // Try common field names - sessions is the most common for Rezdy
-      if (Array.isArray(data.sessions)) return data.sessions;
-      if (Array.isArray(data.availability)) return data.availability;
-      if (Array.isArray(data.data)) return data.data;
-      if (Array.isArray(data.items)) return data.items;
-    }
-    
-    // Handle different response structures
-    if (Array.isArray(data)) {
-      return data;
-    } else if (data && Array.isArray(data.data)) {
-      return data.data;
-    } else if (data && Array.isArray(data.availability)) {
-      return data.availability;
-    } else if (data && Array.isArray(data.sessions)) {
-      return data.sessions;
-    } else if (data && Array.isArray(data.items)) {
-      return data.items;
-    } else if (data && typeof data === 'object' && !data.requestStatus) {
-      // Single availability object (but not if it's just a requestStatus wrapper)
-      return [data];
-    }
-    
-    // Unexpected response structure - log only in debug mode
-    if (process.env.debug) {
-      console.log(`Unexpected response structure for product ${productId}:`, JSON.stringify(data, null, 2));
-    }
-    
-    return [];
+    return extractAvailabilityData(data, productId);
   }
 
   /**
    * Validates API token by checking if products can be retrieved
-   * @param {Object} params - Validation parameters
-   * @param {Object} params.token - Token object
-   * @param {string} params.token.endpoint - API endpoint URL
-   * @param {string} params.token.apiKey - API key for authentication
-   * @returns {Promise<boolean>} True if token is valid, false otherwise
    */
   async validateToken({
     token: {
@@ -276,9 +565,7 @@ class Plugin {
   }) {
     const validatedEndpoint = this.validateEndpoint(endpoint);
     const url = `${validatedEndpoint}/products`;
-    const headers = getHeaders({
-      apiKey,
-    });
+    const headers = getHeaders({ apiKey });
     try {
       const products = R.path(['data', 'products'], await this.axios({
         method: 'get',
@@ -293,11 +580,6 @@ class Plugin {
 
   /**
    * Searches for products
-   * @param {Object} params - Search parameters
-   * @param {Object} params.token - Token object with endpoint and apiKey
-   * @param {Object} [params.payload] - Search payload with optional productId
-   * @param {Object} params.typeDefsAndQueries - GraphQL type definitions and query
-   * @returns {Promise<Object>} Object with products array
    */
   async searchProducts({
     token: {
@@ -317,23 +599,26 @@ class Plugin {
         url = `${url}/${payload.productId}`;
       }
     }
-    const headers = getHeaders({
-      apiKey,
-    });
+    const headers = getHeaders({ apiKey });
     let results = R.pathOr([], ['data', 'products'], await this.axios({
       method: 'get',
       url,
       headers,
     }));
     if (!Array.isArray(results)) results = [results];
+
     let products = await Promise.map(results, async product => {
-      return translateProduct({
+      const translated = await translateProduct({
         rootValue: product,
         typeDefs: productTypeDefs,
         query: productQuery,
       });
+      return {
+        ...translated,
+        getCreateBookingFields: Array.isArray(R.path(['bookingFields'], product)) ? product.bookingFields : [],
+      };
     });
-    // dynamic extra filtering
+
     if (!isNilOrEmpty(payload)) {
       const extraFilters = R.omit(['productId'], payload);
       if (Object.keys(extraFilters).length > 0) {
@@ -351,33 +636,16 @@ class Plugin {
   }
 
   /**
-   * Searches for quote (not implemented)
-   * @param {Object} params - Search parameters
-   * @param {Object} params.token - Token object with endpoint and apiKey
-   * @param {Object} params.payload - Search payload with productIds and optionIds
-   * @returns {Promise<Object>} Object with empty quote array
+   * Searches for quote (not implemented - Rezdy API doesn't expose a quote endpoint)
    */
-  async searchQuote({
-    token: {
-      endpoint,
-      apiKey,
-    },
-    payload: {
-      productIds,
-      optionIds,
-    },
-  }) {
-    // Not implemented - Rezdy API doesn't support quote endpoint
+  async searchQuote() {
     return { quote: [] };
   }
 
   /**
-   * Searches for availability for given products
-   * @param {Object} params - Search parameters
-   * @param {Object} params.token - Token object with endpoint and apiKey
-   * @param {Object} params.payload - Search payload with productIds, dates, etc.
-   * @param {Object} params.typeDefsAndQueries - GraphQL type definitions and query
-   * @returns {Promise<Object>} Object with availability array
+   * Searches for availability for given products.
+   * Mirrors ti2-rezdy's structure: thin orchestration that fans out per
+   * product to `fetchAvailabilityForProduct`.
    */
   async searchAvailability({
     token: {
@@ -399,266 +667,197 @@ class Plugin {
     },
   }) {
     assert(this.jwtKey, 'JWT secret should be set');
-    assert(
-      productIds.length === optionIds.length,
-      'mismatched productIds/options length',
-    );
-    assert(
-      optionIds.length === units.length,
-      'mismatched options/units length',
-    );
+    assert(Array.isArray(productIds) && productIds.length > 0, 'productIds are required');
     assert(productIds.every(Boolean), 'some invalid productId(s)');
-    assert(optionIds.every(Boolean), 'some invalid optionId(s)');
+
+    const normalisedOptionIds = normaliseOptionIds(productIds, optionIds);
+    const normalisedUnits = normaliseUnits(productIds, units);
+
+    if (Array.isArray(optionIds) && optionIds.length > 0) {
+      assert(optionIds.every(Boolean), 'some invalid optionId(s)');
+    }
+
     const validatedEndpoint = this.validateEndpoint(endpoint);
     const localDateStart = moment(startDate, dateFormat).format('YYYY-MM-DD HH:mm:ss');
     const localDateEnd = moment(endDate, dateFormat).format('YYYY-MM-DD 23:59:59');
-    const headers = getHeaders({
-      apiKey,
-    });
-    const url = `${validatedEndpoint}/availability`;
-    let availability = (
-      await Promise.map(productIds, async (productId, ix) => {
-        const response = await this.axios({
-          method: 'get',
-          url: `${url}?productCode=${encodeURIComponent(productId)}&startTimeLocal=${encodeURIComponent(localDateStart)}&endTimeLocal=${encodeURIComponent(localDateEnd)}`,
-          headers,
-        });
-        
-        // Extract availability data from response using helper function
-        return this.extractAvailabilityData(response.data, productId);
-      }, { concurrency: CONCURRENCY })
-    );
-    // Filter out any null/undefined values and ensure all elements are arrays
-    availability = availability.filter(Boolean).map(avails => Array.isArray(avails) ? avails : []);
-    
-    // Fetch pickup points once per product (not per availability session)
-    const pickupPointsByProduct = await Promise.map(productIds, async (productId) => {
-      return R.pathOr([], ['data', 'pickupLocations'], await this.axios({
-        method: 'get',
-        url: `${validatedEndpoint}/products/${productId}/pickups`,
+    const headers = getHeaders({ apiKey });
+
+    // Fetch pickup points and product bookingFields in parallel — both feed
+    // into per-product availability translation below.
+    const [pickupPointsByProduct, bookingFieldsByProductCode] = await Promise.all([
+      Promise.map(productIds, async (productId) => fetchPickupPointsForProduct({
+        axios: this.axios,
+        validatedEndpoint,
         headers,
-      }));
-    }, { concurrency: CONCURRENCY });
-    
-    availability = await Promise.map(availability,
-      async (avails, ix) => {
-        return await Promise.map(avails,
-          async avail => {
-            const pickupPoints = pickupPointsByProduct[ix];
-            
-            // Map all possible field variations from Rezdy API response
-            // First, ensure we have the basic fields from the API response
-            // Status: If not provided, infer from seatsAvailable (if seatsAvailable > 0, consider it AVAILABLE)
-            let status = avail.status || avail.availabilityStatus || avail.availability?.status;
-            const seatsAvailable = this.calculateSeatsAvailable(avail);
-            if (!status) {
-              // If seats are available, assume it's AVAILABLE; otherwise, we can't determine
-              status = seatsAvailable > 0 ? STATUS_AVAILABLE : null;
-            }
-            
-            const startTimeLocal = avail.startTimeLocal || avail.startTime || avail.start;
-            const endTimeLocal = avail.endTimeLocal || avail.endTime || avail.end;
-            const allDay = avail.allDay !== undefined ? avail.allDay : (avail.allDayEvent || false);
-            const priceOptions = avail.priceOptions || avail.prices || avail.pricingOptions || [];
+        productId,
+      }), { concurrency: CONCURRENCY }),
+      fetchBookingFieldsByProductCode({
+        axios: this.axios,
+        validatedEndpoint,
+        headers,
+        productCodes: productIds,
+      }),
+    ]);
 
-            if (!startTimeLocal || !status) {
-              return null;
-            }
-            
-            // Validate status is one of the expected values
-            if (status !== STATUS_AVAILABLE && status !== STATUS_FREESALE) {
-              return null;
-            }
-            
-            const rootValue = {
-              ...avail, // Spread original avail object first to preserve all fields
-              pickupPoints,
-              unitsWithQuantity: units[ix],
-              // Override with normalized field names that resolvers expect
-              status,
-              startTimeLocal,
-              endTimeLocal,
-              allDay,
-              seatsAvailable,
-              priceOptions: Array.isArray(priceOptions) ? priceOptions : [],
-            };
-            
-            const result = await translateAvailability({
-              typeDefs: availTypeDefs,
-              query: availQuery,
-              rootValue,
-              variableValues: {
-                productId: productIds[ix],
-                optionId: optionIds[ix],
-                currency,
-                unitsWithQuantity: units[ix],
-                jwtKey: this.jwtKey,
-              },
-            });
-
-            return result;
-        });
-      },
-    );
-    
-    // Ensure clean structure: filter out null/undefined items and ensure proper array structure
-    // Combine map and filter operations for better performance
-    availability = availability
-      .map(avails => {
-        if (!Array.isArray(avails)) return [];
-        return avails.filter(avail => avail !== null && avail !== undefined);
+    const availabilityByProduct = await Promise.map(productIds, async (productId, ix) => (
+      fetchAvailabilityForProduct({
+        axios: this.axios,
+        validatedEndpoint,
+        headers,
+        productId,
+        optionId: normalisedOptionIds[ix],
+        units: normalisedUnits[ix] || [],
+        localDateStart,
+        localDateEnd,
+        currency,
+        jwtKey: this.jwtKey,
+        availTypeDefs,
+        availQuery,
+        pickupPoints: pickupPointsByProduct[ix] || [],
+        bookingFields: bookingFieldsByProductCode[productId] || [],
       })
-      .filter(avails => Array.isArray(avails) && avails.length > 0);
-    
-    return { availability };
+    ), { concurrency: CONCURRENCY });
+
+    // Drop products with no surviving slots so the response shape matches
+    // the pre-refactor behaviour (empty product groups removed).
+    const availability = availabilityByProduct.filter(slots => Array.isArray(slots) && slots.length > 0);
+
+    return {
+      availability,
+      getCreateBookingFields: bookingFieldsByProductCode[productIds[0]] || [],
+    };
   }
 
   /**
-   * Gets availability calendar for given products
-   * @param {Object} params - Calendar parameters
-   * @param {Object} params.token - Token object with endpoint and apiKey
-   * @param {Object} params.payload - Calendar payload with productIds, dates, etc.
-   * @param {Object} params.typeDefsAndQueries - GraphQL type definitions and query
-   * @returns {Promise<Object>} Object with availability array
+   * Gets availability calendar for given products.
+   * Mirrors ti2-rezdy: simply delegates to `searchAvailability` since both
+   * endpoints share identical request/response semantics in this plugin.
    */
-  async availabilityCalendar({
+  async availabilityCalendar(args) {
+    return this.searchAvailability(args);
+  }
+
+  /**
+   * Searches for pickup points for a given product.
+   * Added for parity with ti2-rezdy's `searchPickupPoints`.
+   */
+  async searchPickupPoints({
     token: {
       endpoint,
       apiKey,
     },
-    payload: {
-      productIds,
-      optionIds,
-      units,
-      startDate,
-      endDate,
-      currency,
-      dateFormat,
-    },
-    typeDefsAndQueries: {
-      availTypeDefs,
-      availQuery,
-    },
+    payload: { productId },
+    typeDefsAndQueries: { pickupTypeDefs, pickupQuery } = {},
   }) {
-    assert(
-      productIds.length === optionIds.length,
-      'mismatched productIds/options length',
-    );
-    assert(
-      optionIds.length === units.length,
-      'mismatched options/units length',
-    );
-    assert(productIds.every(Boolean), 'some invalid productId(s)');
-    assert(optionIds.every(Boolean), 'some invalid optionId(s)');
+    assert(productId, 'productId is required');
     const validatedEndpoint = this.validateEndpoint(endpoint);
-    const localDateStart = moment(startDate, dateFormat).format('YYYY-MM-DD HH:mm:ss');
-    const localDateEnd = moment(endDate, dateFormat).format('YYYY-MM-DD 23:59:59');
-    const headers = getHeaders({
-      apiKey,
+    const headers = getHeaders({ apiKey });
+
+    const pickupPoints = await fetchPickupPointsForProduct({
+      axios: this.axios,
+      validatedEndpoint,
+      headers,
+      productId,
     });
-    const url = `${validatedEndpoint}/availability`;
-    let availability = (
-      await Promise.map(productIds, async (productId, ix) => {
-        const response = await this.axios({
-          method: 'get',
-          url: `${url}?productCode=${encodeURIComponent(productId)}&startTimeLocal=${encodeURIComponent(localDateStart)}&endTimeLocal=${encodeURIComponent(localDateEnd)}`,
-          headers,
-        });
-        
-        // Extract availability data from response using helper function
-        return this.extractAvailabilityData(response.data, productId);
-      }, { concurrency: CONCURRENCY })
-    );
-    // Filter out any null/undefined values and ensure all elements are arrays
-    availability = availability.filter(Boolean).map(avails => Array.isArray(avails) ? avails : []);
-    
-    // Fetch pickup points once per product (not per availability session)
-    const pickupPointsByProduct = await Promise.map(productIds, async (productId) => {
-      return R.pathOr([], ['data', 'pickupLocations'], await this.axios({
-        method: 'get',
-        url: `${validatedEndpoint}/products/${productId}/pickups`,
-        headers,
-      }));
-    }, { concurrency: CONCURRENCY });
-    
-    availability = await Promise.map(availability,
-      async (avails, ix) => {
-        return await Promise.map(avails,
-          async avail => {            
-            const pickupPoints = pickupPointsByProduct[ix];
-            
-            // Map all possible field variations from Rezdy API response
-            // First, ensure we have the basic fields from the API response
-            // Status: If not provided, infer from seatsAvailable (if seatsAvailable > 0, consider it AVAILABLE)
-            let status = avail.status || avail.availabilityStatus || avail.availability?.status;
-            const seatsAvailable = this.calculateSeatsAvailable(avail);
-            if (!status) {
-              // If seats are available, assume it's AVAILABLE; otherwise, we can't determine
-              status = seatsAvailable > 0 ? STATUS_AVAILABLE : null;
-            }
-            
-            const startTimeLocal = avail.startTimeLocal || avail.startTime || avail.start;
-            const endTimeLocal = avail.endTimeLocal || avail.endTime || avail.end;
-            const allDay = avail.allDay !== undefined ? avail.allDay : (avail.allDayEvent || false);
-            const priceOptions = avail.priceOptions || avail.prices || avail.pricingOptions || [];
 
-            if (!startTimeLocal || !status) {
-              return null;
-            }
-            
-            // Validate status is one of the expected values
-            if (status !== STATUS_AVAILABLE && status !== STATUS_FREESALE) {
-              return null;
-            }
-            
-            const rootValue = {
-              ...avail, // Spread original avail object first to preserve all fields
-              pickupPoints,
-              unitsWithQuantity: units[ix],
-              // Override with normalized field names that resolvers expect
-              status,
-              startTimeLocal,
-              endTimeLocal,
-              allDay,
-              seatsAvailable,
-              priceOptions: Array.isArray(priceOptions) ? priceOptions : [],
-            };
+    // If a graphql schema/query is supplied, translate each point. Otherwise
+    // return the raw Rezdy pickup-location records.
+    let translatePickupPoint;
+    if (pickupTypeDefs && pickupQuery) {
+      try {
+        // eslint-disable-next-line global-require
+        ({ translatePickupPoint } = require('./resolvers/pickup-point'));
+      } catch (_) {
+        translatePickupPoint = null;
+      }
+    }
 
-            const result = await translateAvailability({
-              typeDefs: availTypeDefs,
-              query: availQuery,
-              rootValue,
-              variableValues: {
-                productId: productIds[ix],
-                optionId: optionIds[ix],
-                currency,
-                unitsWithQuantity: units[ix],
-                jwtKey: this.jwtKey,
-              },
-            });
-            
-            return result;
-        });
-      },
+    if (typeof translatePickupPoint === 'function') {
+      const translatedPoints = await Promise.map(pickupPoints, async (point) => (
+        translatePickupPoint({
+          rootValue: point,
+          typeDefs: pickupTypeDefs,
+          query: pickupQuery,
+        })
+      ), { concurrency: CONCURRENCY });
+      return { pickupPoints: translatedPoints };
+    }
+
+    return { pickupPoints };
+  }
+
+  async getCreateBookingFields({ axios, token, payload = {}, query = {} } = {}) {
+    const requestAxios = axios || this.axios;
+    const requestData = Object.keys(query).length > 0 ? query : payload;
+    const { productId } = requestData;
+
+    assert(requestAxios, 'axios is required');
+    assert(token, 'token is required');
+    assert(productId, 'productId is required');
+
+    const validatedEndpoint = this.validateEndpoint(R.path(['endpoint'], token));
+    const headers = getHeaders({ apiKey: R.path(['apiKey'], token) });
+
+    const bookingFieldsByProductCode = await fetchBookingFieldsByProductCode({
+      axios: requestAxios,
+      validatedEndpoint,
+      headers,
+      productCodes: [productId],
+    });
+    const bookingFields = bookingFieldsByProductCode[productId] || [];
+    const defaultCoreTypeById = {
+      firstName: 'short',
+      lastName: 'short',
+      emailAddress: 'short',
+      phoneNumber: 'short',
+      country: 'short',
+      postCode: 'short',
+    };
+    const mappedFields = bookingFields
+      .map(toCreateBookingFieldModel)
+      .filter(Boolean)
+      .map((field) => {
+        if (!field || field.type !== 'extended-option') return field;
+        const defaultType = defaultCoreTypeById[field.id];
+        const hasUsableOptions = Array.isArray(field.options) && field.options.length > 0;
+        if (!defaultType || hasUsableOptions) return field;
+        return { ...field, type: defaultType };
+      });
+    const fieldswithGender = decorateGenderField(mappedFields);
+    const countryOptions = getIso31661Alpha2Countries();
+    const fieldsWithCountry = decorateCountryFields(fieldswithGender, countryOptions);
+    const fields = fieldsWithCountry.map((field) => {
+      if (field && field.id === 'country') {
+        return { ...field, type: 'short' };
+      }
+      return field;
+    });
+
+    const excludedCustomerFieldIds = new Set(
+      (Array.isArray(DEFAULT_EXCLUDED_CUSTOMER_QUESTION_IDS) ? DEFAULT_EXCLUDED_CUSTOMER_QUESTION_IDS : [])
+        .map(id => String(id || '').trim())
+        .filter(Boolean),
     );
-    // Ensure clean structure: filter out null/undefined items and empty arrays
-    // Combine map and filter operations for better performance
-    availability = availability
-      .map(avails => {
-        if (!Array.isArray(avails)) return [];
-        return avails.filter(avail => avail !== null && avail !== undefined);
-      })
-      .filter(avails => Array.isArray(avails) && avails.length > 0);
-    return { availability };
+
+    const additionalCustomerFields = fields
+      .filter(field => field && field.visiblePerBooking)
+      .filter(field => !excludedCustomerFieldIds.has(String(field.id || '').trim()))
+      .map(field => ({ ...field, required: Boolean(field.requiredPerBooking), isCustomerField: true }));
+    const additionalCustomerFieldsById = additionalCustomerFields.reduce((acc, field) => ({
+      ...acc,
+      [field.id]: field,
+    }), {});
+    const decoratedFields = fields.map(field => additionalCustomerFieldsById[field.id] || field);
+
+    const normalizedCoreIds = new Set(Object.values(CORE_CREATE_BOOKING_FIELD_IDS_BY_LABEL));
+    const customFields = decoratedFields
+      .filter(field => field && !normalizedCoreIds.has(field.id))
+      .filter(field => !(field && field.visiblePerBooking));
+    return { fields: decoratedFields, customFields, additionalCustomerFields };
   }
 
   /**
    * Creates a booking from an availability key
-   * @param {Object} params - Booking creation parameters
-   * @param {Object} params.token - Token object with endpoint, apiKey, and optional agentCode
-   * @param {Object} params.payload - Booking payload with availabilityKey, holder, etc.
-   * @param {Object} params.typeDefsAndQueries - GraphQL type definitions and query
-   * @returns {Promise<Object>} Object with booking result
    */
   async createBooking({
     token: {
@@ -671,11 +870,11 @@ class Plugin {
       holder,
       notes,
       reference,
-      // settlementMethod,
       pickupPoint,
       participants,
       payments,
       createdBy,
+      customFieldValues,
       integrationIsDirectBooking = false,
     },
     typeDefsAndQueries: {
@@ -686,107 +885,137 @@ class Plugin {
     assert(availabilityKey, 'an availability code is required !');
     assert(R.path(['name'], holder), "a holder's first name is required");
     assert(R.path(['surname'], holder), "a holder's surname is required");
-    // Agent code is only required for non-direct bookings
     if (!integrationIsDirectBooking) {
       assert(agentCode, 'an agent code is required');
     }
+
+    const effectiveHolder = mergeHolderWithCustomFieldValues(holder, customFieldValues);
     const validatedEndpoint = this.validateEndpoint(endpoint);
-    const headers = getHeaders({
-      apiKey,
-    });
+    const headers = getHeaders({ apiKey });
     const urlForCreateBooking = `${validatedEndpoint}/bookings`;
+
     const dataFromAvailKey = await jwt.verify(availabilityKey, this.jwtKey);
-    
+    const availabilityItems = dataFromAvailKey.items || [];
+    const productCodes = availabilityItems
+      .map(item => R.path(['productCode'], item))
+      .filter(Boolean);
+
+    const bookingFieldsByProductCode = await fetchBookingFieldsByProductCode({
+      axios: this.axios,
+      validatedEndpoint,
+      headers,
+      productCodes,
+    });
+
+    const allBookingFields = Object.values(bookingFieldsByProductCode).flat();
+    const bookingLevelFields = mergeFieldsWithExplicitValues({
+      generatedFields: buildBookingFields({
+        fieldDefinitions: allBookingFields,
+        sources: [effectiveHolder],
+        visibleKey: 'visiblePerBooking',
+        requiredKey: 'requiredPerBooking',
+      }),
+      explicitFields: filterFieldRowsForBookingLevelMerge(
+        Array.isArray(effectiveHolder.fields) ? effectiveHolder.fields : undefined,
+        allBookingFields,
+      ),
+      fieldDefinitions: allBookingFields,
+    });
+    const holderEmail = resolveBookingFieldValue({
+      label: 'Email',
+      sources: [effectiveHolder],
+    });
+    const holderPhone = resolveBookingFieldValue({
+      label: 'Mobile',
+      sources: [effectiveHolder],
+    });
+
     // Build the booking payload matching Rezdy API format
     const bookingData = {
       // Comments (internal notes, not visible to customers)
       ...(notes ? { comments: notes } : {}),
-      // Customer information
       customer: {
         firstName: holder.name,
         lastName: holder.surname,
-        // Skip email if value is 'collect' (case-insensitive) - used for special cases
-        ...(String(R.path(['emailAddress'], holder) || '').toLowerCase() !== SKIP_EMAIL_VALUE
-          ? { email: R.path(['emailAddress'], holder) }
+        // Skip email if value is 'collect' (case-insensitive) - special-case
+        // signal to Rezdy that the email will be collected later.
+        ...(String(holderEmail || '').toLowerCase() !== SKIP_EMAIL_VALUE
+          ? { email: holderEmail }
           : {}),
-        phone: R.pathOr('', ['phoneNumber'], holder),
+        phone: holderPhone || '',
       },
-      // Created by (if provided)
+      ...(bookingLevelFields.length > 0 ? { fields: bookingLevelFields } : {}),
       ...(createdBy ? { createdBy } : {}),
-      // Items from availability key
-      items: (dataFromAvailKey.items || []).map(item => {
+      items: availabilityItems.map(item => {
         // Ensure quantities have both optionLabel and value
         const quantities = (item.quantities || []).map(qty => {
-          // If quantity already has optionLabel and value, use it as-is
           if (qty.optionLabel && qty.value !== undefined) {
             return {
               optionLabel: qty.optionLabel,
               value: qty.value,
             };
           }
-          // If it's just a value, try to get optionLabel from the original structure
-          // This shouldn't happen if JWT is created correctly, but handle it anyway
+          // Defensive fallback when JWT contained an older shape.
           return {
             optionLabel: qty.optionLabel || qty.label || 'Quantity',
             value: qty.value !== undefined ? qty.value : qty.quantity || 1,
           };
         });
-        
+
         const itemData = {
           productCode: item.productCode,
           startTimeLocal: item.startTimeLocal,
           quantities,
         };
-        // Add participants if provided (should match quantity)
-        // If participants are provided, use them; otherwise, create from holder
+        const productBookingFields = bookingFieldsByProductCode[item.productCode] || [];
+        const participantFieldDefinitions = productBookingFields.length > 0
+          ? productBookingFields
+          : DEFAULT_PARTICIPANT_BOOKING_FIELDS;
         const totalQuantity = quantities.reduce((sum, qty) => sum + (qty.value || qty.quantity || 0), 0);
         const participantTarget = Math.max(totalQuantity, 1);
         const defaultParticipant = {
-          firstName: holder.name,
-          lastName: holder.surname,
+          firstName: effectiveHolder.name,
+          lastName: effectiveHolder.surname,
         };
 
         let participantsToAdd = participants;
         if (!participantsToAdd || !Array.isArray(participantsToAdd) || participantsToAdd.length === 0) {
-          // If no participants provided, create one per quantity
           participantsToAdd = Array.from({ length: participantTarget }, () => ({ ...defaultParticipant }));
         } else if (participantsToAdd.length < participantTarget) {
-          // If fewer participants provided than quantities, pad with holder
           const padding = Array.from(
             { length: participantTarget - participantsToAdd.length },
             () => ({ ...defaultParticipant }),
           );
           participantsToAdd = participantsToAdd.concat(padding);
         }
-        
-        if (participantsToAdd && Array.isArray(participantsToAdd) && participantsToAdd.length > 0) {
+        if (Array.isArray(participantsToAdd) && participantsToAdd.length > participantTarget) {
+          throw new Error(
+            `participants count (${participantsToAdd.length}) exceeds total quantity (${participantTarget})`,
+          );
+        }
+
+        if (Array.isArray(participantsToAdd) && participantsToAdd.length > 0) {
           itemData.participants = participantsToAdd.map(participant => {
-            // If participant is an object with fields, use it directly
-            if (participant.fields && Array.isArray(participant.fields)) {
-              return { fields: participant.fields };
-            }
-            // Otherwise, build fields from participant object
-            const fields = [];
-            if (participant.firstName || participant.name) {
-              fields.push({
-                label: 'First Name',
-                value: participant.firstName || participant.name,
-              });
-            }
-            if (participant.lastName || participant.surname) {
-              fields.push({
-                label: 'Last Name',
-                value: participant.lastName || participant.surname,
-              });
-            }
-            // Add any other fields
-            if (participant.fields) {
-              fields.push(...participant.fields);
-            }
+            const participantData = normalizeParticipantData(participant);
+            const generatedFields = buildBookingFields({
+              fieldDefinitions: participantFieldDefinitions,
+              // Use holder fallback for legacy flows where per-passenger values are
+              // provided at booking root (for example customFieldValues).
+              sources: [participantData, effectiveHolder],
+              visibleKey: 'visiblePerParticipant',
+              requiredKey: 'requiredPerParticipant',
+            });
+            const fields = mergeFieldsWithExplicitValues({
+              generatedFields,
+              explicitFields: filterFieldRowsForParticipantLevelMerge(
+                Array.isArray(participantData.fields) ? participantData.fields : undefined,
+                participantFieldDefinitions,
+              ),
+              fieldDefinitions: participantFieldDefinitions,
+            });
             return { fields };
           });
         }
-        // Add pickup location if provided
         if (pickupPoint) {
           itemData.pickupLocation = {
             locationName: pickupPoint,
@@ -794,12 +1023,10 @@ class Plugin {
         }
         return itemData;
       }),
-      // Payments - ensure proper format matching Rezdy API
+      // Payments - normalised to Rezdy's required shape (always >=1 entry).
       payments: (() => {
-        // If payments are provided, format them correctly
         if (payments && Array.isArray(payments) && payments.length > 0) {
           return payments.map(payment => {
-            // Validate and normalize payment amount
             let amount = payment.amount || 0;
             if (typeof amount !== 'number' || isNaN(amount) || amount < 0) {
               if (process.env.debug) {
@@ -807,8 +1034,6 @@ class Plugin {
               }
               amount = 0;
             }
-            
-            // Ensure payment has all required fields in correct format
             return {
               amount,
               type: payment.type || PAYMENT_TYPE_CASH,
@@ -817,20 +1042,15 @@ class Plugin {
             };
           });
         }
-        // If no payments provided, add a default payment
-        // Note: Rezdy API requires at least one payment
-        // Use totalAmount from availability key if available
+        // Rezdy requires at least one payment line. Use the JWT-supplied
+        // total when available so the recorded amount matches the quote.
         let totalAmount = dataFromAvailKey.totalAmount || 0;
-        
-        // Validate totalAmount is a valid number
         if (typeof totalAmount !== 'number' || isNaN(totalAmount) || totalAmount < 0) {
           if (process.env.debug) {
             console.warn('Invalid totalAmount from availability key, setting to 0:', dataFromAvailKey.totalAmount);
           }
           totalAmount = 0;
         }
-        
-        // Always include amount field (required by Rezdy API), even if 0
         return [{
           amount: totalAmount,
           type: PAYMENT_TYPE_CASH,
@@ -838,36 +1058,31 @@ class Plugin {
           label: 'Payment for booking',
         }];
       })(),
-      // Reseller reference if provided
       ...(reference ? { resellerReference: reference } : {}),
-      // Source Channel if provided
-      // NOTE: The Rezdy UI uses the name as Agent Code, but the API expects it as Source Channel
+      // The Rezdy UI surfaces this as "Agent Code" but the API field is
+      // `sourceChannel` — keep that mapping explicit here.
       ...(agentCode ? { sourceChannel: agentCode } : {}),
     };
-    
-    let booking = R.path(['data'], await this.axios({
+
+    const booking = R.path(['data'], await this.axios({
       method: 'post',
       url: urlForCreateBooking,
       data: bookingData,
       headers,
     }));
-    return ({
-      booking: await translateBooking({
+
+    return {
+      booking: await toTranslatedBooking({
         rootValue: booking,
-        typeDefs: bookingTypeDefs,
-        query: bookingQuery,
-        apiEndpoint: validatedEndpoint,
-      })
-    });
+        bookingTypeDefs,
+        bookingQuery,
+        validatedEndpoint,
+      }),
+    };
   }
 
   /**
    * Cancels a booking
-   * @param {Object} params - Cancellation parameters
-   * @param {Object} params.token - Token object with endpoint and apiKey
-   * @param {Object} params.payload - Payload with bookingId or id
-   * @param {Object} params.typeDefsAndQueries - GraphQL type definitions and query
-   * @returns {Promise<Object>} Object with cancellation result
    */
   async cancelBooking({
     token: {
@@ -885,32 +1100,25 @@ class Plugin {
   }) {
     assert(!isNilOrEmpty(bookingId) || !isNilOrEmpty(id), 'Invalid booking id');
     const validatedEndpoint = this.validateEndpoint(endpoint);
-    const headers = getHeaders({
-      apiKey,
-    });
+    const headers = getHeaders({ apiKey });
     const url = `${validatedEndpoint}/bookings/${bookingId || id}/cancel`;
     const booking = R.path(['data'], await this.axios({
       method: 'delete',
       url,
       headers,
     }));
-    return ({
-      cancellation: await translateBooking({
+    return {
+      cancellation: await toTranslatedBooking({
         rootValue: booking,
-        typeDefs: bookingTypeDefs,
-        query: bookingQuery,
-        apiEndpoint: validatedEndpoint,
-      })
-    });
+        bookingTypeDefs,
+        bookingQuery,
+        validatedEndpoint,
+      }),
+    };
   }
 
   /**
    * Searches for bookings by ID or date range
-   * @param {Object} params - Search parameters
-   * @param {Object} params.token - Token object with endpoint and apiKey
-   * @param {Object} params.payload - Search payload with bookingId or date range
-   * @param {Object} params.typeDefsAndQueries - GraphQL type definitions and query
-   * @returns {Promise<Object>} Object with bookings array
    */
   async searchBooking({
     token: {
@@ -936,9 +1144,8 @@ class Plugin {
       'at least one parameter is required',
     );
     const validatedEndpoint = this.validateEndpoint(endpoint);
-    const headers = getHeaders({
-      apiKey,
-    });
+    const headers = getHeaders({ apiKey });
+
     let hadNonNotFoundError = false;
     const searchByUrl = async url => {
       try {
@@ -948,31 +1155,22 @@ class Plugin {
           headers,
         });
         const data = R.path(['data'], response);
-        // Check if the response has requestStatus with success: false
-        // This is a valid response from Rezdy API, not an error
         if (data && data.requestStatus && !data.requestStatus.success) {
-          // Error code 24 means "No order found" - this is expected when trying multiple search methods
-          // Return null to indicate no results found
+          // Error code 24 ("No order found") - expected when probing multiple
+          // search forms; surface as null so the caller can keep trying.
           return null;
         }
-        // Handle different response structures:
-        // - Direct booking lookup: returns single booking object
-        // - Search endpoints: returns { bookings: [...] }
-        // - Some endpoints might return the booking directly in data
         if (data.bookings) {
           return data.bookings;
         }
-        // If it's a single booking object (has orderNumber), return as array
         if (data.orderNumber) {
           return [data];
         }
-        // Otherwise return the data as-is (might be an array or object)
         return Array.isArray(data) ? data : (data ? [data] : []);
       } catch (err) {
-        // Handle errors gracefully - return null for "not found" scenarios
         const errorCode = R.path(['response', 'data', 'requestStatus', 'error', 'errorCode'], err);
         if (errorCode === ERROR_CODE_NO_ORDER_FOUND) {
-          return null; // "No order found" is expected when trying multiple search methods
+          return null;
         }
         hadNonNotFoundError = true;
         if (process.env.debug) {
@@ -982,10 +1180,10 @@ class Plugin {
             message: err.message,
           });
         }
-        // For other errors, return null as well to allow other search methods to try
         return null;
       }
     };
+
     const bookings = await (async () => {
       let url;
       if (!isNilOrEmpty(bookingId)) {
@@ -994,22 +1192,18 @@ class Plugin {
           searchByUrl(`${validatedEndpoint}/bookings?resellerReference=${bookingId}`),
           searchByUrl(`${validatedEndpoint}/bookings?search=${bookingId}`),
         ]);
-        // Filter out null values and flatten arrays, then deduplicate by orderNumber
         const allBookings = results.filter(Boolean).reduce((acc, result) => {
           if (Array.isArray(result)) {
             return acc.concat(result);
           }
           return acc.concat([result]);
         }, []);
-        // Deduplicate by orderNumber to avoid returning same booking multiple times
         const seen = new Set();
         return allBookings.filter(booking => {
           const orderNumber = booking?.orderNumber || booking?.id;
-          // Filter out bookings without identifiers
           if (!orderNumber) {
             return false;
           }
-          // Filter out duplicates
           if (seen.has(orderNumber)) {
             return false;
           }
@@ -1028,17 +1222,15 @@ class Plugin {
             headers,
           });
           const data = R.path(['data'], response);
-          // Check if the response has requestStatus with success: false
           if (data && data.requestStatus && !data.requestStatus.success) {
             return [];
           }
           return R.pathOr([], ['bookings'], data);
         } catch (err) {
-          // Handle error responses gracefully
           if (err.response && err.response.data && err.response.data.requestStatus) {
             const errorCode = R.path(['response', 'data', 'requestStatus', 'error', 'errorCode'], err);
             if (errorCode === ERROR_CODE_NO_ORDER_FOUND) {
-              return []; // "No order found" - return empty array
+              return [];
             }
           }
           throw err;
@@ -1046,20 +1238,22 @@ class Plugin {
       }
       return [];
     })();
+
     if ((!bookings || bookings.length === 0) && hadNonNotFoundError) {
       throw new Error('Search booking failed due to API errors');
     }
-    return ({
+
+    return {
       bookings: await Promise.map(Array.isArray(bookings) ? bookings : [bookings], async booking => {
         if (!booking) return null;
-        return translateBooking({
+        return toTranslatedBooking({
           rootValue: booking,
-          typeDefs: bookingTypeDefs,
-          query: bookingQuery,
-          apiEndpoint: validatedEndpoint,
+          bookingTypeDefs,
+          bookingQuery,
+          validatedEndpoint,
         });
-      }).then(results => results.filter(Boolean))
-    });
+      }).then(results => results.filter(Boolean)),
+    };
   }
 }
 

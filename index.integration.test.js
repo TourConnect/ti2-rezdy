@@ -2,6 +2,7 @@
 const R = require('ramda');
 const moment = require('moment');
 const axios = require('axios');
+const jwt = require('jsonwebtoken');
 
 const Plugin = require('./index');
 
@@ -183,6 +184,7 @@ describe('mocked integration tests', () => {
       
       expect(Array.isArray(retVal.products)).toBeTruthy();
       expect(retVal.products.length).toBeGreaterThan(0);
+      expect(Array.isArray(retVal.products[0].getCreateBookingFields)).toBeTruthy();
     });
     
     it('should find the Vancouver Nights product', async () => {
@@ -226,6 +228,93 @@ describe('mocked integration tests', () => {
       expect(retVal.products.length).toBeGreaterThan(0);
       expect(retVal.products[0].productName).toContain('Night');
     });
+
+    it('should return create booking fields using product bookingFields', async () => {
+      const retVal = await app.getCreateBookingFields({
+        token,
+        query: {
+          productId: '120',
+        },
+      });
+
+      expect(Array.isArray(retVal.fields)).toBeTruthy();
+      expect(Array.isArray(retVal.customFields)).toBeTruthy();
+      expect(Array.isArray(retVal.additionalCustomerFields)).toBeTruthy();
+      expect(retVal.fields).toContainEqual(expect.objectContaining({
+        id: 'firstName',
+        required: true,
+        requiredPerBooking: false,
+        requiredPerParticipant: true,
+        visiblePerParticipant: true,
+      }));
+      expect(retVal.fields).toContainEqual(expect.objectContaining({
+        id: 'lastName',
+        required: true,
+        requiredPerBooking: false,
+        requiredPerParticipant: true,
+        visiblePerParticipant: true,
+      }));
+      expect(retVal.fields).toContainEqual(expect.objectContaining({
+        id: 'emailAddress',
+        required: true,
+        requiredPerBooking: true,
+        requiredPerParticipant: false,
+      }));
+      expect(retVal.fields).toContainEqual(expect.objectContaining({
+        id: 'phoneNumber',
+        required: true,
+        requiredPerBooking: true,
+        requiredPerParticipant: false,
+      }));
+      expect(retVal.customFields).toContainEqual(expect.objectContaining({
+        id: 'certificationLevel',
+        isPerUnitItem: true,
+        required: false,
+        visiblePerParticipant: true,
+        visiblePerBooking: false,
+        requiredPerParticipant: false,
+        requiredPerBooking: false,
+      }));
+      expect(retVal.additionalCustomerFields).toContainEqual(expect.objectContaining({
+        id: 'specialRequirements',
+        required: false,
+        requiredPerBooking: false,
+        requiredPerParticipant: false,
+        visiblePerBooking: true,
+        isCustomerField: true,
+      }));
+      expect(retVal.fields).toContainEqual(expect.objectContaining({
+        id: 'specialRequirements',
+        required: false,
+        requiredPerBooking: false,
+        requiredPerParticipant: false,
+        visiblePerBooking: true,
+        isCustomerField: true,
+      }));
+      expect(retVal.customFields).toContainEqual(expect.objectContaining({
+        id: 'certificationAgency',
+        type: 'extended-option',
+        options: [],
+      }));
+      // Country and postCode are built-in contact fields (the host UI renders
+      // them for the holder). They must surface under `fields`, not duplicate
+      // into `customFields`. This mirrors the ti2-rezdy pattern where
+      // `country` and `postCode` are part of DEFAULT_CREATE_BOOKING_FIELDS.
+      expect(retVal.fields).toContainEqual(expect.objectContaining({
+        id: 'country',
+        type: 'short',
+      }));
+      expect(retVal.customFields).not.toContainEqual(expect.objectContaining({
+        id: 'country',
+      }));
+      expect(retVal.fields).toContainEqual(expect.objectContaining({
+        id: 'postCode',
+        type: 'short',
+      }));
+      expect(retVal.customFields).not.toContainEqual(expect.objectContaining({
+        id: 'postCode',
+      }));
+    });
   });
   
   describe('availability search', () => {
@@ -249,6 +338,7 @@ describe('mocked integration tests', () => {
       const { availability } = retVal;
       expect(availability).toHaveLength(1);
       expect(availability[0].length).toBeGreaterThan(0);
+      expect(Array.isArray(R.path([0, 0, 'getCreateBookingFields'], availability))).toBeTruthy();
     });
     
     it('should search availability and return an availability key', async () => {
@@ -271,6 +361,7 @@ describe('mocked integration tests', () => {
       const { availability } = retVal;
       expect(availability).toHaveLength(1);
       expect(availability[0].length).toBeGreaterThan(0);
+      expect(Array.isArray(R.path([0, 0, 'getCreateBookingFields'], availability))).toBeTruthy();
       
       const availabilityKey = R.path([0, 0, 'key'], availability);
       expect(availabilityKey).toBeTruthy();
@@ -335,6 +426,352 @@ describe('mocked integration tests', () => {
       expect(createBookingRequest[0].data).toMatchObject({
         sourceChannel: token.agentCode,
       });
+    });
+
+    it('should merge holder.fields (by id) into top-level Rezdy fields like ti2-rezdy', async () => {
+      await app.createBooking({
+        token,
+        typeDefsAndQueries,
+        payload: {
+          availabilityKey,
+          reference: 'E2E-FIELDS',
+          holder: {
+            name: 'John',
+            surname: 'Doe',
+            phoneNumber: '+1234567890',
+            emailAddress: 'john.doe@example.com',
+            fields: [
+              { id: 'specialRequirements', value: 'Access ramp needed' },
+            ],
+          },
+        },
+      });
+      const createBookingRequest = axios.mock.calls.find(([config]) =>
+        config && config.method === 'post' && config.url && config.url.includes('/bookings')
+      );
+      expect(createBookingRequest[0].data.fields).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            label: 'Special Requirements',
+            value: 'Access ramp needed',
+          }),
+        ]),
+      );
+    });
+
+    it('should map root-level customFieldValues (tcoutland) onto Rezdy fields', async () => {
+      await app.createBooking({
+        token,
+        typeDefsAndQueries,
+        payload: {
+          availabilityKey,
+          reference: 'E2E-CUSTOM-ROOT',
+          holder: {
+            name: 'A',
+            surname: 'B',
+            emailAddress: 'a@b.com',
+          },
+          customFieldValues: [
+            {
+              field: {
+                id: 'specialRequirements',
+                title: 'Special Requirements',
+                type: 'short',
+              },
+              value: 'Vegan',
+            },
+          ],
+        },
+      });
+      const createBookingRequest = axios.mock.calls
+        .filter(([config]) => config && config.method === 'post' && config.url && config.url.includes('/bookings'))
+        .pop();
+      expect(createBookingRequest[0].data.fields).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            label: 'Special Requirements',
+            value: 'Vegan',
+          }),
+        ]),
+      );
+    });
+
+    it('should serialize object-valued country field to country code', async () => {
+      await app.createBooking({
+        token,
+        typeDefsAndQueries,
+        payload: {
+          availabilityKey,
+          holder: {
+            name: 'A',
+            surname: 'B',
+            emailAddress: 'a@b.com',
+            country: { label: 'Australia', value: 'AU' },
+          },
+        },
+      });
+      const createBookingRequest = axios.mock.calls
+        .filter(([config]) => config && config.method === 'post' && config.url && config.url.includes('/bookings'))
+        .pop();
+      const bookingFields = createBookingRequest[0].data.fields || [];
+      expect(bookingFields).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            label: 'Country',
+            value: 'AU',
+          }),
+        ]),
+      );
+    });
+
+    it('should send visiblePerParticipant-only answers on participants, not on booking root fields', async () => {
+      await app.createBooking({
+        token,
+        typeDefsAndQueries,
+        payload: {
+          availabilityKey,
+          holder: {
+            name: 'A',
+            surname: 'B',
+            emailAddress: 'a@b.com',
+          },
+          customFieldValues: [
+            {
+              field: {
+                id: 'certificationLevel',
+                title: 'Certification level',
+                type: 'short',
+              },
+              value: 'Advanced',
+            },
+          ],
+        },
+      });
+      const createBookingRequest = axios.mock.calls
+        .filter(([config]) => config && config.method === 'post' && config.url && config.url.includes('/bookings'))
+        .pop();
+      const { data } = createBookingRequest[0];
+      const topLabels = (data.fields || []).map(f => f.label);
+      expect(topLabels).not.toContain('Certification level');
+      const pFields = R.path(['items', 0, 'participants', 0, 'fields'], data) || [];
+      expect(pFields).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ label: 'Certification level', value: 'Advanced' }),
+        ]),
+      );
+    });
+
+    it('should keep only "Ask for each Participant" rows on passenger fields (tcoutlook flow)', async () => {
+      await app.createBooking({
+        token,
+        typeDefsAndQueries,
+        payload: {
+          availabilityKey,
+          holder: {
+            name: 'A',
+            surname: 'B',
+            emailAddress: 'a@b.com',
+          },
+          participants: [{
+            firstName: 'Passenger',
+            lastName: 'One',
+            fields: [
+              { id: 'certificationLevel', value: 'Advanced' },
+              { id: 'specialRequirements', value: 'Wheelchair access' },
+              { id: 'dropOffAddress', value: '123 Main Street' },
+            ],
+          }],
+        },
+      });
+      const createBookingRequest = axios.mock.calls
+        .filter(([config]) => config && config.method === 'post' && config.url && config.url.includes('/bookings'))
+        .pop();
+      const { data } = createBookingRequest[0];
+      const participantFields = R.path(['items', 0, 'participants', 0, 'fields'], data) || [];
+      const participantLabels = participantFields.map(field => field.label);
+      expect(participantLabels).toContain('Certification level');
+      expect(participantLabels).not.toContain('Special Requirements');
+      expect(participantLabels).not.toContain('Drop off address');
+    });
+
+    it('should map UI nested participant field rows without duplicating holder fallbacks', async () => {
+      await app.createBooking({
+        token,
+        typeDefsAndQueries,
+        payload: {
+          availabilityKey,
+          holder: {
+            name: 'Sarah',
+            surname: 'Cooper',
+            emailAddress: 'sarah@example.com',
+          },
+          participants: [
+            {
+              fields: [
+                { field: { id: 'firstName', title: 'First Name' }, value: 'Sarah' },
+                { field: { id: 'lastName', title: 'Last Name' }, value: 'Cooper' },
+                { field: { id: 'weight', title: 'Weight' }, value: '140' },
+                { field: { id: 'gender', title: 'Gender' }, value: 'FEMALE' },
+              ],
+            },
+            {
+              fields: [
+                { field: { id: 'firstName', title: 'Adult 2: First Name' }, value: 'Peter' },
+                { field: { id: 'lastName', title: 'Adult 2: Last Name' }, value: 'Cooper' },
+                { field: { id: 'weight', title: 'Adult 2: Weight' }, value: '180' },
+                { field: { id: 'gender', title: 'Adult 2: Gender' }, value: 'MALE' },
+              ],
+            },
+          ],
+        },
+      });
+      const createBookingRequest = axios.mock.calls
+        .filter(([config]) => config && config.method === 'post' && config.url && config.url.includes('/bookings'))
+        .pop();
+      const { data } = createBookingRequest[0];
+      const participant1Fields = R.path(['items', 0, 'participants', 0, 'fields'], data) || [];
+      const participant2Fields = R.path(['items', 0, 'participants', 1, 'fields'], data) || [];
+
+      expect(participant1Fields).toEqual(expect.arrayContaining([
+        expect.objectContaining({ label: 'Weight', value: '140' }),
+        expect.objectContaining({ label: 'Gender', value: 'FEMALE' }),
+      ]));
+      expect(participant2Fields).toEqual(expect.arrayContaining([
+        expect.objectContaining({ label: 'First Name', value: 'Peter' }),
+        expect.objectContaining({ label: 'Last Name', value: 'Cooper' }),
+        expect.objectContaining({ label: 'Weight', value: '180' }),
+        expect.objectContaining({ label: 'Gender', value: 'MALE' }),
+      ]));
+    });
+
+    it('should normalize traveler-prefixed labels when participant field id is missing', async () => {
+      await app.createBooking({
+        token,
+        typeDefsAndQueries,
+        payload: {
+          availabilityKey,
+          holder: {
+            name: 'A',
+            surname: 'B',
+            emailAddress: 'a@b.com',
+          },
+          participants: [{
+            firstName: 'Passenger',
+            lastName: 'One',
+            fields: [
+              { label: 'Traveler 1: Certification level', value: 'Advanced' },
+            ],
+          }],
+        },
+      });
+      const createBookingRequest = axios.mock.calls
+        .filter(([config]) => config && config.method === 'post' && config.url && config.url.includes('/bookings'))
+        .pop();
+      const { data } = createBookingRequest[0];
+      const participantFields = R.path(['items', 0, 'participants', 0, 'fields'], data) || [];
+      expect(participantFields).toEqual(expect.arrayContaining([
+        expect.objectContaining({ label: 'Certification level', value: 'Advanced' }),
+      ]));
+    });
+
+    it('should map participants customFieldValues into participant fields', async () => {
+      await app.createBooking({
+        token,
+        typeDefsAndQueries,
+        payload: {
+          availabilityKey,
+          holder: {
+            name: 'A',
+            surname: 'B',
+            emailAddress: 'a@b.com',
+          },
+          participants: [{
+            firstName: 'Passenger',
+            lastName: 'One',
+            customFieldValues: [
+              {
+                field: { id: 'certificationLevel', title: 'Certification level' },
+                value: 'Advanced',
+              },
+            ],
+          }],
+        },
+      });
+      const createBookingRequest = axios.mock.calls
+        .filter(([config]) => config && config.method === 'post' && config.url && config.url.includes('/bookings'))
+        .pop();
+      const { data } = createBookingRequest[0];
+      const participantFields = R.path(['items', 0, 'participants', 0, 'fields'], data) || [];
+      expect(participantFields).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ label: 'Certification level', value: 'Advanced' }),
+        ]),
+      );
+    });
+
+    it('should include requiredPerParticipant fields for padded passenger rows', async () => {
+      const productsFixture = require('./__fixtures__/products');
+      const product = productsFixture.products.find(p => p.productCode === '120');
+      const originalBookingFields = product.bookingFields.map(field => ({ ...field }));
+      product.bookingFields = originalBookingFields.map((field) => {
+        if (field.label === 'Email') {
+          return {
+            ...field,
+            requiredPerParticipant: true,
+            visiblePerParticipant: false,
+            requiredPerBooking: false,
+          };
+        }
+        if (field.label === 'Special Requirements') {
+          return {
+            ...field,
+            requiredPerParticipant: true,
+            visiblePerParticipant: false,
+            requiredPerBooking: false,
+          };
+        }
+        return field;
+      }).concat([{
+        label: 'Passenger weight',
+        requiredPerParticipant: true,
+        requiredPerBooking: false,
+        visiblePerParticipant: false,
+        visiblePerBooking: false,
+        fieldType: 'String',
+      }]);
+
+      try {
+        await app.createBooking({
+          token,
+          typeDefsAndQueries,
+          payload: {
+            availabilityKey,
+            holder: {
+              name: 'A',
+              surname: 'B',
+              emailAddress: 'a@b.com',
+            },
+            participants: [{
+              firstName: 'Passenger',
+              lastName: 'One',
+            }],
+          },
+        });
+      } finally {
+        product.bookingFields = originalBookingFields;
+      }
+
+      const createBookingRequest = axios.mock.calls
+        .filter(([config]) => config && config.method === 'post' && config.url && config.url.includes('/bookings'))
+        .pop();
+      const { data } = createBookingRequest[0];
+      const passenger2Fields = R.path(['items', 0, 'participants', 1, 'fields'], data) || [];
+      const passenger2Labels = passenger2Fields.map(field => field.label);
+      expect(passenger2Labels).toContain('First Name');
+      expect(passenger2Labels).toContain('Last Name');
+      expect(passenger2Labels).toContain('Email');
+      expect(passenger2Labels).toContain('Special Requirements');
+      expect(passenger2Labels).toContain('Passenger weight');
     });
 
     it('should allow direct booking without agentCode', async () => {
@@ -530,6 +967,35 @@ describe('mocked integration tests', () => {
             },
           })
         ).rejects.toThrow("holder's surname is required");
+      });
+
+      it('should throw error when participants exceed total quantity', async () => {
+        await expect(
+          app.createBooking({
+            token,
+            typeDefsAndQueries,
+            payload: {
+              availabilityKey: jwt.sign({
+                items: [{
+                  productCode: '120',
+                  startTimeLocal: `${moment().add(1, 'd').format(dateFormat)} 10:00:00`,
+                  quantities: [{ optionLabel: 'Adult', value: 2 }],
+                }],
+                totalAmount: 300,
+              }, app.jwtKey),
+              holder: {
+                name: 'A',
+                surname: 'B',
+                emailAddress: 'a@b.com',
+              },
+              participants: [
+                { firstName: 'P1', lastName: 'One' },
+                { firstName: 'P2', lastName: 'Two' },
+                { firstName: 'P3', lastName: 'Three' },
+              ],
+            },
+          })
+        ).rejects.toThrow(/participants count \(3\) exceeds total quantity \(2\)/);
       });
     });
 
