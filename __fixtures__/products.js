@@ -34,7 +34,81 @@ module.exports = {
       "quantityRequiredMin": 1,
       "quantityRequiredMax": 10,
       "durationMinutes": 180,
-      "bookingMode": "INVENTORY"
+      "bookingMode": "INVENTORY",
+      "bookingFields": [
+        {
+          "label": "First Name",
+          "requiredPerParticipant": true,
+          "requiredPerBooking": false,
+          "visiblePerParticipant": true,
+          "visiblePerBooking": false,
+          "fieldType": "String"
+        },
+        {
+          "label": "Last Name",
+          "requiredPerParticipant": true,
+          "requiredPerBooking": false,
+          "visiblePerParticipant": true,
+          "visiblePerBooking": false,
+          "fieldType": "String"
+        },
+        {
+          "label": "Mobile",
+          "requiredPerParticipant": false,
+          "requiredPerBooking": true,
+          "visiblePerParticipant": false,
+          "visiblePerBooking": true,
+          "fieldType": "Phone"
+        },
+        {
+          "label": "Email",
+          "requiredPerParticipant": false,
+          "requiredPerBooking": true,
+          "visiblePerParticipant": false,
+          "visiblePerBooking": true,
+          "fieldType": "String"
+        },
+        {
+          "label": "Special Requirements",
+          "requiredPerParticipant": false,
+          "requiredPerBooking": false,
+          "visiblePerParticipant": false,
+          "visiblePerBooking": true,
+          "fieldType": "String"
+        },
+        {
+          "label": "Certification level",
+          "requiredPerParticipant": false,
+          "requiredPerBooking": false,
+          "visiblePerParticipant": true,
+          "visiblePerBooking": false,
+          "fieldType": "String"
+        },
+        {
+          "label": "Certification agency",
+          "requiredPerParticipant": false,
+          "requiredPerBooking": false,
+          "visiblePerParticipant": true,
+          "visiblePerBooking": false,
+          "fieldType": "List"
+        },
+        {
+          "label": "Country",
+          "requiredPerParticipant": false,
+          "requiredPerBooking": false,
+          "visiblePerParticipant": false,
+          "visiblePerBooking": true,
+          "fieldType": "List"
+        },
+        {
+          "label": "Postcode",
+          "requiredPerParticipant": false,
+          "requiredPerBooking": false,
+          "visiblePerParticipant": false,
+          "visiblePerBooking": true,
+          "fieldType": "String"
+        }
+      ]
     },
     {
       "productCode": "121",
@@ -64,7 +138,25 @@ module.exports = {
       "quantityRequiredMin": 1,
       "quantityRequiredMax": 20,
       "durationMinutes": 120,
-      "bookingMode": "INVENTORY"
+      "bookingMode": "INVENTORY",
+      "bookingFields": [
+        {
+          "label": "First Name",
+          "requiredPerParticipant": true,
+          "requiredPerBooking": false,
+          "visiblePerParticipant": true,
+          "visiblePerBooking": false,
+          "fieldType": "String"
+        },
+        {
+          "label": "Last Name",
+          "requiredPerParticipant": true,
+          "requiredPerBooking": false,
+          "visiblePerParticipant": true,
+          "visiblePerBooking": false,
+          "fieldType": "String"
+        }
+      ]
     }
   ]
 };
