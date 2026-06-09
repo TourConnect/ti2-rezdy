@@ -1187,29 +1187,48 @@ class Plugin {
     const bookings = await (async () => {
       let url;
       if (!isNilOrEmpty(bookingId)) {
-        const results = await Promise.all([
-          searchByUrl(`${validatedEndpoint}/bookings/${bookingId}`),
-          searchByUrl(`${validatedEndpoint}/bookings?resellerReference=${bookingId}`),
-          searchByUrl(`${validatedEndpoint}/bookings?search=${bookingId}`),
-        ]);
-        const allBookings = results.filter(Boolean).reduce((acc, result) => {
-          if (Array.isArray(result)) {
-            return acc.concat(result);
-          }
-          return acc.concat([result]);
-        }, []);
-        const seen = new Set();
-        return allBookings.filter(booking => {
-          const orderNumber = booking?.orderNumber || booking?.id;
-          if (!orderNumber) {
-            return false;
-          }
-          if (seen.has(orderNumber)) {
-            return false;
-          }
-          seen.add(orderNumber);
-          return true;
-        });
+        const dedupeBookings = items => {
+          const seen = new Set();
+          return items.filter(booking => {
+            const dedupeKey = booking?.orderNumber
+              || booking?.id
+              || booking?.bookingId
+              || booking?.reference
+              || booking?.resellerReference
+              || booking?.supplierBookingId;
+            if (!dedupeKey) return false;
+            if (seen.has(dedupeKey)) return false;
+            seen.add(dedupeKey);
+            return true;
+          });
+        };
+        const trySearch = async searchUrl => {
+          const result = await searchByUrl(searchUrl);
+          const normalizedResults = (Array.isArray(result) ? result : [result]).filter(Boolean);
+          const uniqueResults = dedupeBookings(normalizedResults);
+          return uniqueResults;
+        };
+
+        const byId = await trySearch(`${validatedEndpoint}/bookings/${bookingId}`);
+        if (byId.length > 0) {
+          return byId;
+        }
+
+        const byResellerReference = await trySearch(
+          `${validatedEndpoint}/bookings?resellerReference=${bookingId}`,
+        );
+        if (byResellerReference.length > 0) {
+          return byResellerReference;
+        }
+
+        const bySearch = await trySearch(
+          `${validatedEndpoint}/bookings?search=${bookingId}`,
+        );
+        if (bySearch.length > 0) {
+          return bySearch;
+        }
+
+        return [];
       }
       if (!isNilOrEmpty(travelDateStart)) {
         const localDateStart = moment(travelDateStart, dateFormat).format('YYYY-MM-DD');

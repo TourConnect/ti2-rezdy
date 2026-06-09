@@ -827,7 +827,137 @@ describe('mocked integration tests', () => {
       expect(Array.isArray(retVal.bookings)).toBeTruthy();
       expect(retVal.bookings.length).toBeGreaterThan(0);
     });
-    
+
+    it('should stop after first successful booking search endpoint', async () => {
+      const bookingFixture = require('./__fixtures__/bookingResponse');
+      const defaultAxiosImpl = axios.getMockImplementation();
+      axios.mockImplementation((config) => {
+        if (config.method === 'get' && config.url === `${token.endpoint}/bookings/SEQ-STOP-FIRST`) {
+          return Promise.resolve({ data: bookingFixture.searchBookingResults[0] });
+        }
+        if (config.method === 'get' && config.url === `${token.endpoint}/bookings?resellerReference=SEQ-STOP-FIRST`) {
+          return Promise.resolve({ data: { bookings: bookingFixture.searchBookingResults } });
+        }
+        if (config.method === 'get' && config.url === `${token.endpoint}/bookings?search=SEQ-STOP-FIRST`) {
+          return Promise.resolve({ data: { bookings: bookingFixture.searchBookingResults } });
+        }
+        return defaultAxiosImpl(config);
+      });
+
+      try {
+        const retVal = await app.searchBooking({
+          token,
+          typeDefsAndQueries,
+          payload: {
+            bookingId: 'SEQ-STOP-FIRST',
+          },
+        });
+        expect(Array.isArray(retVal.bookings)).toBeTruthy();
+        expect(retVal.bookings.length).toBeGreaterThan(0);
+      } finally {
+        axios.mockImplementation(defaultAxiosImpl);
+      }
+
+      const searchUrls = axios.mock.calls
+        .map(([config]) => config)
+        .filter(config => config && config.method === 'get' && typeof config.url === 'string')
+        .map(config => config.url)
+        .filter(url => url.includes('/bookings/SEQ-STOP-FIRST') || url.includes('SEQ-STOP-FIRST'));
+      expect(searchUrls).toEqual([
+        `${token.endpoint}/bookings/SEQ-STOP-FIRST`,
+      ]);
+    });
+
+    it('should call second endpoint only when first endpoint has no booking', async () => {
+      const bookingFixture = require('./__fixtures__/bookingResponse');
+      const defaultAxiosImpl = axios.getMockImplementation();
+      axios.mockImplementation((config) => {
+        if (config.method === 'get' && config.url === `${token.endpoint}/bookings/SEQ-TO-SECOND`) {
+          return Promise.resolve({ data: { bookings: [] } });
+        }
+        if (config.method === 'get' && config.url === `${token.endpoint}/bookings?resellerReference=SEQ-TO-SECOND`) {
+          return Promise.resolve({ data: { bookings: bookingFixture.searchBookingResults } });
+        }
+        if (config.method === 'get' && config.url === `${token.endpoint}/bookings?search=SEQ-TO-SECOND`) {
+          return Promise.resolve({ data: { bookings: bookingFixture.searchBookingResults } });
+        }
+        return defaultAxiosImpl(config);
+      });
+
+      try {
+        const retVal = await app.searchBooking({
+          token,
+          typeDefsAndQueries,
+          payload: {
+            bookingId: 'SEQ-TO-SECOND',
+          },
+        });
+        expect(Array.isArray(retVal.bookings)).toBeTruthy();
+        expect(retVal.bookings.length).toBeGreaterThan(0);
+      } finally {
+        axios.mockImplementation(defaultAxiosImpl);
+      }
+
+      const searchUrls = axios.mock.calls
+        .map(([config]) => config)
+        .filter(config => config && config.method === 'get' && typeof config.url === 'string')
+        .map(config => config.url)
+        .filter(url => url.includes('/bookings/SEQ-TO-SECOND') || url.includes('SEQ-TO-SECOND'));
+      expect(searchUrls).toEqual([
+        `${token.endpoint}/bookings/SEQ-TO-SECOND`,
+        `${token.endpoint}/bookings?resellerReference=SEQ-TO-SECOND`,
+      ]);
+    });
+
+    it('should accept supplierBookingId as fallback identity and stop chain', async () => {
+      const bookingFixture = require('./__fixtures__/bookingResponse');
+      const defaultAxiosImpl = axios.getMockImplementation();
+      axios.mockImplementation((config) => {
+        if (config.method === 'get' && config.url === `${token.endpoint}/bookings/SEQ-SUPPLIER-ID`) {
+          return Promise.resolve({
+            data: {
+              ...bookingFixture.searchBookingResults[0],
+              orderNumber: undefined,
+              id: undefined,
+              bookingId: undefined,
+              reference: undefined,
+              supplierBookingId: 'SUP-SEQ-001',
+            },
+          });
+        }
+        if (config.method === 'get' && config.url === `${token.endpoint}/bookings?resellerReference=SEQ-SUPPLIER-ID`) {
+          return Promise.resolve({ data: { bookings: bookingFixture.searchBookingResults } });
+        }
+        if (config.method === 'get' && config.url === `${token.endpoint}/bookings?search=SEQ-SUPPLIER-ID`) {
+          return Promise.resolve({ data: { bookings: bookingFixture.searchBookingResults } });
+        }
+        return defaultAxiosImpl(config);
+      });
+
+      try {
+        const retVal = await app.searchBooking({
+          token,
+          typeDefsAndQueries,
+          payload: {
+            bookingId: 'SEQ-SUPPLIER-ID',
+          },
+        });
+        expect(Array.isArray(retVal.bookings)).toBeTruthy();
+        expect(retVal.bookings.length).toBeGreaterThan(0);
+      } finally {
+        axios.mockImplementation(defaultAxiosImpl);
+      }
+
+      const searchUrls = axios.mock.calls
+        .map(([config]) => config)
+        .filter(config => config && config.method === 'get' && typeof config.url === 'string')
+        .map(config => config.url)
+        .filter(url => url.includes('/bookings/SEQ-SUPPLIER-ID') || url.includes('SEQ-SUPPLIER-ID'));
+      expect(searchUrls).toEqual([
+        `${token.endpoint}/bookings/SEQ-SUPPLIER-ID`,
+      ]);
+    });
+
     it('should search bookings by supplier booking ID', async () => {
       const retVal = await app.searchBooking({
         token,
