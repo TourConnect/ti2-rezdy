@@ -1130,14 +1130,17 @@ class Plugin {
       travelDateStart,
       travelDateEnd,
       dateFormat,
+      reference,
     },
     typeDefsAndQueries: {
       bookingTypeDefs,
       bookingQuery,
     },
   }) {
+    const hasBookingId = !isNilOrEmpty(bookingId);
+    const hasReference = !isNilOrEmpty(reference);
     assert(
-      !isNilOrEmpty(bookingId)
+      hasBookingId || hasReference
       || !(
         isNilOrEmpty(travelDateStart) && isNilOrEmpty(travelDateEnd) && isNilOrEmpty(dateFormat)
       ),
@@ -1186,7 +1189,7 @@ class Plugin {
 
     const bookings = await (async () => {
       let url;
-      if (!isNilOrEmpty(bookingId)) {
+      if (hasBookingId || hasReference) {
         const dedupeBookings = items => {
           const seen = new Set();
           return items.filter(booking => {
@@ -1209,25 +1212,26 @@ class Plugin {
           return uniqueResults;
         };
 
-        const byId = await trySearch(`${validatedEndpoint}/bookings/${bookingId}`);
-        if (byId.length > 0) {
-          return byId;
+        if (hasBookingId) {
+          const byId = await trySearch(`${validatedEndpoint}/bookings/${bookingId}`);
+          if (byId.length > 0) {
+            return byId;
+          }
+          const bySearch = await trySearch(
+            `${validatedEndpoint}/bookings?search=${bookingId}`,
+          );
+          if (bySearch.length > 0) {
+            return bySearch;
+          }
+          return [];
         }
 
         const byResellerReference = await trySearch(
-          `${validatedEndpoint}/bookings?resellerReference=${bookingId}`,
+          `${validatedEndpoint}/bookings?resellerReference=${reference}`,
         );
         if (byResellerReference.length > 0) {
           return byResellerReference;
         }
-
-        const bySearch = await trySearch(
-          `${validatedEndpoint}/bookings?search=${bookingId}`,
-        );
-        if (bySearch.length > 0) {
-          return bySearch;
-        }
-
         return [];
       }
       if (!isNilOrEmpty(travelDateStart)) {
