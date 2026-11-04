@@ -27,6 +27,9 @@ const { translateRate } = require('./resolvers/rate');
 
 // Concurrency limit for parallel API requests
 const CONCURRENCY = 3;
+// Rezdy GET /products returns at most 100 rows per request.
+const REZDY_PRODUCT_PAGE_SIZE = 100;
+const REZDY_PRODUCT_PAGE_LIMIT = 200;
 // Rezdy API error code for "No order found" - expected in search scenarios
 const ERROR_CODE_NO_ORDER_FOUND = '24';
 // Default Rezdy API endpoint
@@ -58,6 +61,45 @@ if (process.env.debug) {
 }
 
 const isNilOrEmpty = R.either(R.isNil, R.isEmpty);
+
+const fetchRezdyProductPages = async ({
+  axios,
+  url,
+  headers,
+}) => {
+  const pageSize = REZDY_PRODUCT_PAGE_SIZE;
+  const products = [];
+  const productCodes = new Set();
+  let offset = 0;
+  for (let page = 0; page < REZDY_PRODUCT_PAGE_LIMIT; page += 1) {
+    const pageUrl = new URL(url);
+    pageUrl.searchParams.set('limit', String(pageSize));
+    pageUrl.searchParams.set('offset', String(offset));
+    const rows = R.path(['data', 'products'], await axios({
+      method: 'get',
+      url: pageUrl.toString(),
+      headers,
+    }));
+    if (!Array.isArray(rows)) {
+      throw new Error('Rezdy product catalog page did not return a products array');
+    }
+    const previousProductCount = products.length;
+    for (const product of rows) {
+      assert(product && typeof product.productCode === 'string' && product.productCode.trim(),
+        'Rezdy product catalog row did not return a productCode');
+      if (!productCodes.has(product.productCode)) {
+        productCodes.add(product.productCode);
+        products.push(product);
+      }
+    }
+    if (rows.length < pageSize) return products;
+    if (products.length === previousProductCount) {
+      throw new Error('Rezdy product catalog page returned no new product codes');
+    }
+    offset += rows.length;
+  }
+  throw new Error('Rezdy product catalog exceeded the page limit');
+};
 
 /**
  * Validates if a string is a valid URL
@@ -593,19 +635,23 @@ class Plugin {
     },
   }) {
     const validatedEndpoint = this.validateEndpoint(endpoint);
-    let url = `${validatedEndpoint}/products`;
-    if (!isNilOrEmpty(payload)) {
-      if (payload.productId) {
-        url = `${url}/${payload.productId}`;
-      }
-    }
     const headers = getHeaders({ apiKey });
-    let results = R.pathOr([], ['data', 'products'], await this.axios({
-      method: 'get',
-      url,
-      headers,
-    }));
-    if (!Array.isArray(results)) results = [results];
+    let results;
+    if (!isNilOrEmpty(payload) && payload.productId) {
+      const response = await this.axios({
+        method: 'get',
+        url: `${validatedEndpoint}/products/${encodeURIComponent(payload.productId)}`,
+        headers,
+      });
+      const product = extractSingleProduct(R.path(['data'], response));
+      results = product ? [product] : [];
+    } else {
+      results = await fetchRezdyProductPages({
+        axios: this.axios,
+        url: `${validatedEndpoint}/products`,
+        headers,
+      });
+    }
 
     let products = await Promise.map(results, async product => {
       const translated = await translateProduct({
@@ -620,7 +666,13 @@ class Plugin {
     });
 
     if (!isNilOrEmpty(payload)) {
-      const extraFilters = R.omit(['productId'], payload);
+      // Keep control keys in sync with Ti2's lib/hasProductSearchSelector.js controlFields.
+      const extraFilters = R.omit([
+        'productId', 'forceRefresh', 'requestId', 'backgroundJob', 'cacheOnly',
+        'fullSyncTrigger', 'admissionOverrideReason', 'fullSyncStartedAt',
+        'fullSyncAdmissionToken', 'scheduledProductSyncEnabled', 'omitServiceCodes',
+        'pickupPointsRequired', 'credentials',
+      ], payload);
       if (Object.keys(extraFilters).length > 0) {
         products = products.filter(
           product => Object.entries(extraFilters).every(
