@@ -27,9 +27,11 @@ const { translateRate } = require('./resolvers/rate');
 
 // Concurrency limit for parallel API requests
 const CONCURRENCY = 3;
-// Rezdy GET /products returns at most 100 rows per request.
+// Rezdy GET /products and GET /bookings return at most 100 rows per request.
 const REZDY_PRODUCT_PAGE_SIZE = 100;
 const REZDY_PRODUCT_PAGE_LIMIT = 200;
+const REZDY_BOOKING_PAGE_SIZE = 100;
+const REZDY_BOOKING_PAGE_LIMIT = 200;
 // Rezdy API error code for "No order found" - expected in search scenarios
 const ERROR_CODE_NO_ORDER_FOUND = '24';
 // Default Rezdy API endpoint
@@ -99,6 +101,77 @@ const fetchRezdyProductPages = async ({
     offset += rows.length;
   }
   throw new Error('Rezdy product catalog exceeded the page limit');
+};
+
+const bookingIdentity = booking => booking?.orderNumber
+  || booking?.id
+  || booking?.bookingId
+  || booking?.reference
+  || booking?.resellerReference
+  || booking?.supplierBookingId;
+
+const isNoOrderFoundError = err => (
+  err
+  && (
+    err.errorCode === ERROR_CODE_NO_ORDER_FOUND
+    || R.path(['response', 'data', 'requestStatus', 'error', 'errorCode'], err) === ERROR_CODE_NO_ORDER_FOUND
+  )
+);
+
+const fetchRezdyBookingPages = async ({
+  axios,
+  url,
+  headers,
+}) => {
+  const pageSize = REZDY_BOOKING_PAGE_SIZE;
+  const bookings = [];
+  const seen = new Set();
+  let offset = 0;
+  for (let page = 0; page < REZDY_BOOKING_PAGE_LIMIT; page += 1) {
+    const pageUrl = `${url}&limit=${pageSize}&offset=${offset}`;
+    let response;
+    try {
+      response = await axios({
+        method: 'get',
+        url: pageUrl,
+        headers,
+      });
+    } catch (err) {
+      if (isNoOrderFoundError(err)) return bookings;
+      throw err;
+    }
+    const data = R.path(['data'], response);
+    if (data && data.requestStatus && !data.requestStatus.success) {
+      if (R.path(['requestStatus', 'error', 'errorCode'], data) === ERROR_CODE_NO_ORDER_FOUND) {
+        return bookings;
+      }
+      if (offset === 0) return [];
+      throw new Error('Rezdy booking search page failed after earlier results');
+    }
+    const rows = R.path(['bookings'], data);
+    if (!Array.isArray(rows)) {
+      throw new Error('Rezdy booking search page did not return a bookings array');
+    }
+    const previousBookingCount = bookings.length;
+    for (const booking of rows) {
+      const identity = bookingIdentity(booking);
+      assert(
+        identity != null && String(identity).trim(),
+        'Rezdy booking search row did not return a booking identity',
+      );
+      const key = String(identity);
+      if (!seen.has(key)) {
+        seen.add(key);
+        bookings.push(booking);
+      }
+    }
+    if (rows.length < pageSize) return bookings;
+    if (bookings.length === previousBookingCount) {
+      throw new Error('Rezdy booking search page returned no new bookings');
+    }
+    offset += rows.length;
+  }
+  throw new Error('Rezdy booking search exceeded the page limit');
 };
 
 /**
@@ -1170,7 +1243,7 @@ class Plugin {
   }
 
   /**
-   * Searches for bookings by ID or date range
+   * Searches for bookings by ID, customer name, purchase date, or travel date
    */
   async searchBooking({
     token: {
@@ -1179,6 +1252,9 @@ class Plugin {
     },
     payload: {
       bookingId,
+      name,
+      purchaseDateStart,
+      purchaseDateEnd,
       travelDateStart,
       travelDateEnd,
       dateFormat,
@@ -1191,13 +1267,16 @@ class Plugin {
   }) {
     const hasBookingId = !isNilOrEmpty(bookingId);
     const hasReference = !isNilOrEmpty(reference);
+    const searchName = typeof name === 'string' ? name.trim() : name;
+    const hasName = !isNilOrEmpty(searchName);
+    const hasPurchaseDates = !isNilOrEmpty(purchaseDateStart) || !isNilOrEmpty(purchaseDateEnd);
+    const hasTravelDates = !isNilOrEmpty(travelDateStart) || !isNilOrEmpty(travelDateEnd);
     assert(
-      hasBookingId || hasReference
-      || !(
-        isNilOrEmpty(travelDateStart) && isNilOrEmpty(travelDateEnd) && isNilOrEmpty(dateFormat)
-      ),
+      hasBookingId || hasReference || hasName || hasPurchaseDates || hasTravelDates,
       'at least one parameter is required',
     );
+    const toRezdyIsoStart = value => moment(value, dateFormat).format('YYYY-MM-DD[T]00:00:00[Z]');
+    const toRezdyIsoEnd = value => moment(value, dateFormat).format('YYYY-MM-DD[T]23:59:59[Z]');
     const validatedEndpoint = this.validateEndpoint(endpoint);
     const headers = getHeaders({ apiKey });
 
@@ -1245,12 +1324,7 @@ class Plugin {
         const dedupeBookings = items => {
           const seen = new Set();
           return items.filter(booking => {
-            const dedupeKey = booking?.orderNumber
-              || booking?.id
-              || booking?.bookingId
-              || booking?.reference
-              || booking?.resellerReference
-              || booking?.supplierBookingId;
+            const dedupeKey = bookingIdentity(booking);
             if (!dedupeKey) return false;
             if (seen.has(dedupeKey)) return false;
             seen.add(dedupeKey);
@@ -1286,30 +1360,26 @@ class Plugin {
         }
         return [];
       }
-      if (!isNilOrEmpty(travelDateStart)) {
-        const localDateStart = moment(travelDateStart, dateFormat).format('YYYY-MM-DD');
-        const localDateEnd = moment(travelDateEnd, dateFormat).format('YYYY-MM-DD');
-        url = `${validatedEndpoint}/bookings?minTourStartTime=${encodeURIComponent(localDateStart)}&maxTourStartTime=${encodeURIComponent(localDateEnd)}`;
-        try {
-          const response = await this.axios({
-            method: 'get',
-            url,
-            headers,
-          });
-          const data = R.path(['data'], response);
-          if (data && data.requestStatus && !data.requestStatus.success) {
-            return [];
-          }
-          return R.pathOr([], ['bookings'], data);
-        } catch (err) {
-          if (err.response && err.response.data && err.response.data.requestStatus) {
-            const errorCode = R.path(['response', 'data', 'requestStatus', 'error', 'errorCode'], err);
-            if (errorCode === ERROR_CODE_NO_ORDER_FOUND) {
-              return [];
-            }
-          }
-          throw err;
+      if (hasName || hasPurchaseDates || hasTravelDates) {
+        // Rezdy GET /bookings date filters are ISO 8601. search is a customer-name prefix match.
+        const query = [];
+        if (hasName) {
+          query.push(`search=${encodeURIComponent(searchName)}`);
         }
+        if (hasPurchaseDates) {
+          query.push(`minDateCreated=${encodeURIComponent(toRezdyIsoStart(purchaseDateStart || purchaseDateEnd))}`);
+          query.push(`maxDateCreated=${encodeURIComponent(toRezdyIsoEnd(purchaseDateEnd || purchaseDateStart))}`);
+        }
+        if (hasTravelDates) {
+          query.push(`minTourStartTime=${encodeURIComponent(toRezdyIsoStart(travelDateStart || travelDateEnd))}`);
+          query.push(`maxTourStartTime=${encodeURIComponent(toRezdyIsoEnd(travelDateEnd || travelDateStart))}`);
+        }
+        url = `${validatedEndpoint}/bookings?${query.join('&')}`;
+        return fetchRezdyBookingPages({
+          axios: this.axios,
+          url,
+          headers,
+        });
       }
       return [];
     })();
