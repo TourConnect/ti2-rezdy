@@ -1067,17 +1067,74 @@ describe('mocked integration tests', () => {
     });
     
     it('should search bookings by travel date', async () => {
+      const travelDate = moment().add(2, 'M').format(dateFormat);
       const retVal = await app.searchBooking({
         token,
         typeDefsAndQueries,
         payload: {
-          travelDateStart: moment().add(2, 'M').format(dateFormat),
-          travelDateEnd: moment().add(2, 'M').format(dateFormat),
+          travelDateStart: travelDate,
+          travelDateEnd: travelDate,
           dateFormat,
         },
       });
-      
+
       expect(Array.isArray(retVal.bookings)).toBeTruthy();
+      const expectedStart = moment(travelDate, dateFormat).format('YYYY-MM-DD[T]00:00:00[Z]');
+      const expectedEnd = moment(travelDate, dateFormat).format('YYYY-MM-DD[T]23:59:59[Z]');
+      const searchUrls = axios.mock.calls
+        .map(([config]) => config)
+        .filter(config => config && config.method === 'get' && typeof config.url === 'string')
+        .map(config => config.url)
+        .filter(url => url.includes('minTourStartTime='));
+      expect(searchUrls).toEqual([
+        `${token.endpoint}/bookings?minTourStartTime=${encodeURIComponent(expectedStart)}&maxTourStartTime=${encodeURIComponent(expectedEnd)}&limit=100&offset=0`,
+      ]);
+    });
+
+    it('should search bookings by customer name', async () => {
+      const retVal = await app.searchBooking({
+        token,
+        typeDefsAndQueries,
+        payload: {
+          name: 'Jane Doe',
+          dateFormat,
+        },
+      });
+
+      expect(retVal.bookings.length).toBeGreaterThan(0);
+      const searchUrls = axios.mock.calls
+        .map(([config]) => config)
+        .filter(config => config && config.method === 'get' && typeof config.url === 'string')
+        .map(config => config.url)
+        .filter(url => url.includes('search='));
+      expect(searchUrls).toEqual([
+        `${token.endpoint}/bookings?search=${encodeURIComponent('Jane Doe')}&limit=100&offset=0`,
+      ]);
+    });
+
+    it('should search bookings by purchase date', async () => {
+      const purchaseDate = '24/07/2026';
+      const retVal = await app.searchBooking({
+        token,
+        typeDefsAndQueries,
+        payload: {
+          purchaseDateStart: purchaseDate,
+          purchaseDateEnd: purchaseDate,
+          dateFormat,
+        },
+      });
+
+      expect(Array.isArray(retVal.bookings)).toBeTruthy();
+      const expectedStart = moment(purchaseDate, dateFormat).format('YYYY-MM-DD[T]00:00:00[Z]');
+      const expectedEnd = moment(purchaseDate, dateFormat).format('YYYY-MM-DD[T]23:59:59[Z]');
+      const searchUrls = axios.mock.calls
+        .map(([config]) => config)
+        .filter(config => config && config.method === 'get' && typeof config.url === 'string')
+        .map(config => config.url)
+        .filter(url => url.includes('minDateCreated='));
+      expect(searchUrls).toEqual([
+        `${token.endpoint}/bookings?minDateCreated=${encodeURIComponent(expectedStart)}&maxDateCreated=${encodeURIComponent(expectedEnd)}&limit=100&offset=0`,
+      ]);
     });
     
     it('should cancel a booking', async () => {
